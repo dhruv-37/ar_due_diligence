@@ -196,7 +196,7 @@ def node_write_memo(state: PipelineState) -> dict:
     gemini_key = os.environ.get("GEMINI_API_KEY")
 
     llm = ChatGoogleGenerativeAI(
-        model="gemini-2.0-flash",
+        model="gemini-2.5-flash",  # gemini-2.0-flash retired ~June 2026 — was hardcoded to a dead model
         google_api_key=gemini_key,
         temperature=0.2,
     )
