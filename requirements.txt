@@ -1,0 +1,14 @@
+pymupdf
+google-generativeai
+langchain
+langchain-core
+langchain-google-genai
+langchain-community
+langchain-text-splitters
+langgraph
+chromadb
+pandas
+openpyxl
+rapidfuzz
+python-dotenv
+requests
