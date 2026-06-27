@@ -2,11 +2,13 @@
 tools/ratio_tool.py
 ===================
 Fetches live fundamental ratios for an Indian listed company from the
-Financial Modeling Prep (FMP) API and returns them alongside ratios
-computed from the extracted Excel data.
+Financial Modeling Prep (FMP) API, finds live sector/market-cap peers
+via FMP, and returns the company's ratios alongside a peer-median
+benchmark — computed fresh every run, never from a static file.
 
-FMP endpoint used:
+FMP endpoints used:
     /api/v3/ratios/{ticker}?limit=1&apikey={key}
+    /api/v4/stock_peers?symbol={ticker}&apikey={key}
 
 Ticker format: RELIANCE.NS  (NSE-listed stocks)
 
@@ -14,13 +16,21 @@ Computed ratios (from Excel):
     revenue_growth_pct, pat_margin_pct, ebitda_margin_pct,
     operating_cf_to_pat, oci_to_pat_pct, exceptional_to_pbt_pct
 
-FMP ratios (live):
+FMP ratios (live, per company):
     pe_ratio, debt_to_equity, current_ratio, roe, roa,
     operating_profit_margin, net_profit_margin
+
+Peer benchmark (live, computed per run):
+    For each FMP ratio above, the median value across live peers
+    returned by FMP's stock_peers endpoint. No hardcoded sector
+    list, no static JSON file — if FMP can't resolve peers (plan
+    tier, missing NSE coverage, etc.) this comes back empty and
+    the caller is told explicitly via `peer_benchmark_status`.
 """
 
 import json
 import os
+import statistics
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -28,11 +38,14 @@ from pathlib import Path
 import pandas as pd
 from langchain.tools import tool
 
-FMP_BASE = "https://financialmodelingprep.com/api/v3"
+FMP_BASE_V3 = "https://financialmodelingprep.com/api/v3"
+FMP_BASE_V4 = "https://financialmodelingprep.com/api/v4"
+
+# Max peers to query ratios for — keeps latency/quota sane, not a benchmark value
+_MAX_PEERS = 6
 
 
-def _fmp_get(endpoint: str, api_key: str) -> dict | list | None:
-    url = f"{FMP_BASE}{endpoint}&apikey={api_key}"
+def _fmp_get(url: str) -> dict | list | None:
     try:
         with urllib.request.urlopen(url, timeout=10) as resp:
             return json.loads(resp.read().decode())
@@ -49,6 +62,72 @@ def _safe(val, default=None):
         return round(f, 4) if f == f else default  # NaN check
     except (TypeError, ValueError):
         return default
+
+
+def _fetch_company_ratios(ns_ticker: str, api_key: str) -> dict:
+    """Fetch a single company's live FMP ratios. Returns {} on failure."""
+    raw = _fmp_get(f"{FMP_BASE_V3}/ratios/{ns_ticker}?limit=1&apikey={api_key}")
+    if not (isinstance(raw, list) and raw):
+        return {}
+    r = raw[0]
+    return {
+        "pe_ratio":                _safe(r.get("priceEarningsRatio")),
+        "debt_to_equity":          _safe(r.get("debtEquityRatio")),
+        "current_ratio":           _safe(r.get("currentRatio")),
+        "roe":                     _safe(r.get("returnOnEquity")),
+        "roa":                     _safe(r.get("returnOnAssets")),
+        "operating_profit_margin": _safe(r.get("operatingProfitMargin")),
+        "net_profit_margin":       _safe(r.get("netProfitMargin")),
+    }
+
+
+def _fetch_peer_tickers(ns_ticker: str, api_key: str) -> list[str]:
+    """
+    Calls FMP's stock_peers endpoint (same exchange, sector, market-cap band).
+    Returns [] if unavailable — caller must treat that as "no peer data",
+    not silently fall back to a fixed number.
+    """
+    raw = _fmp_get(f"{FMP_BASE_V4}/stock_peers?symbol={ns_ticker}&apikey={api_key}")
+    if isinstance(raw, dict) and "fmp_error" in raw:
+        return []
+    if isinstance(raw, list) and raw:
+        peers = raw[0].get("peersList", []) if isinstance(raw[0], dict) else []
+        return [p for p in peers if isinstance(p, str)][:_MAX_PEERS]
+    return []
+
+
+def _peer_median_ratios(ns_ticker: str, api_key: str) -> tuple[dict, dict]:
+    """
+    Returns (peer_medians, meta) where peer_medians maps each FMP ratio
+    name to the live median across resolved peers, and meta describes
+    how the benchmark was obtained (for transparency to the caller).
+    """
+    peer_tickers = _fetch_peer_tickers(ns_ticker, api_key)
+    meta = {"peer_tickers": peer_tickers, "peers_with_data": 0, "status": "ok"}
+
+    if not peer_tickers:
+        meta["status"] = "no_peers_found"
+        return {}, meta
+
+    per_peer_ratios = []
+    for peer in peer_tickers:
+        ratios = _fetch_company_ratios(peer, api_key)
+        if ratios:
+            per_peer_ratios.append(ratios)
+
+    meta["peers_with_data"] = len(per_peer_ratios)
+    if not per_peer_ratios:
+        meta["status"] = "peers_found_but_no_ratio_data"
+        return {}, meta
+
+    medians = {}
+    for key in ["pe_ratio", "debt_to_equity", "current_ratio", "roe",
+                "roa", "operating_profit_margin", "net_profit_margin"]:
+        vals = [p[key] for p in per_peer_ratios if p.get(key) is not None]
+        if vals:
+            medians[key] = round(statistics.median(vals), 4)
+
+    return medians, meta
 
 
 def _compute_ratios(sheets: dict) -> dict:
@@ -103,8 +182,10 @@ def _compute_ratios(sheets: dict) -> dict:
 @tool
 def ratio_tool(ticker: str, xlsx_path: str) -> str:
     """
-    Fetches live FMP ratios for an NSE-listed stock and computes
-    additional ratios from the extracted Excel file.
+    Fetches live FMP ratios for an NSE-listed stock, computes additional
+    ratios from the extracted Excel file, and benchmarks the company's
+    FMP ratios against the LIVE median of its FMP-resolved sector/market-cap
+    peers (no static thresholds, no hardcoded peer list).
 
     Args:
         ticker:     NSE ticker symbol, e.g. "RELIANCE" (without .NS suffix).
@@ -112,11 +193,19 @@ def ratio_tool(ticker: str, xlsx_path: str) -> str:
 
     Returns:
         JSON string with keys:
-            status          — "success" | "error"
-            ticker          — ticker used
-            computed        — ratios derived from Excel data
-            fmp             — ratios from FMP API
-            error           — error message (only on failure)
+            status            — "success" | "error"
+            ticker            — ticker used
+            computed          — ratios derived from Excel data
+            fmp               — company's own live ratios from FMP API
+            peer_benchmark    — median of live peer ratios (may be {})
+            peer_benchmark_meta — how the benchmark was derived: which
+                                   peer tickers were used, how many had
+                                   usable data, and a status flag the
+                                   caller MUST check before treating
+                                   peer_benchmark as reliable. Status is
+                                   one of: "ok", "no_peers_found",
+                                   "peers_found_but_no_ratio_data".
+            error             — error message (only on failure)
     """
     api_key = os.environ.get("FMP_API_KEY")
     if not api_key:
@@ -146,28 +235,23 @@ def ratio_tool(ticker: str, xlsx_path: str) -> str:
     # ── Computed ratios from Excel ────────────────────────────────────────────
     computed = _compute_ratios(sheets)
 
-    # ── FMP live ratios ───────────────────────────────────────────────────────
+    # ── FMP live ratios for this company ─────────────────────────────────────
     ns_ticker = f"{ticker.upper()}.NS"
-    raw = _fmp_get(f"/ratios/{ns_ticker}?limit=1", api_key)
+    fmp_ratios = _fetch_company_ratios(ns_ticker, api_key)
+    if not fmp_ratios:
+        # Could be a real API error — surface it instead of silently empty
+        raw = _fmp_get(f"{FMP_BASE_V3}/ratios/{ns_ticker}?limit=1&apikey={api_key}")
+        if isinstance(raw, dict) and "fmp_error" in raw:
+            fmp_ratios = raw
 
-    fmp_ratios = {}
-    if isinstance(raw, list) and raw:
-        r = raw[0]
-        fmp_ratios = {
-            "pe_ratio":               _safe(r.get("priceEarningsRatio")),
-            "debt_to_equity":         _safe(r.get("debtEquityRatio")),
-            "current_ratio":          _safe(r.get("currentRatio")),
-            "roe":                    _safe(r.get("returnOnEquity")),
-            "roa":                    _safe(r.get("returnOnAssets")),
-            "operating_profit_margin":_safe(r.get("operatingProfitMargin")),
-            "net_profit_margin":      _safe(r.get("netProfitMargin")),
-        }
-    elif isinstance(raw, dict) and "fmp_error" in raw:
-        fmp_ratios = raw  # pass error through, don't fail entire tool
+    # ── Live peer benchmark (replaces static sector_medians.json) ───────────
+    peer_benchmark, peer_meta = _peer_median_ratios(ns_ticker, api_key)
 
     return json.dumps({
-        "status":   "success",
-        "ticker":   ns_ticker,
-        "computed": computed,
-        "fmp":      fmp_ratios,
+        "status":              "success",
+        "ticker":               ns_ticker,
+        "computed":             computed,
+        "fmp":                  fmp_ratios,
+        "peer_benchmark":       peer_benchmark,
+        "peer_benchmark_meta":  peer_meta,
     })
