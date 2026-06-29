@@ -5,6 +5,23 @@ Consumes the ``page_mapping`` dict produced by Phase 2's
 ``ClassifiedPages.to_dict()`` and writes a new, compacted PDF that contains
 only the four core financial-statement pages, in their original document order.
 
+Also hosts the master orchestrator ``extract_core_financial_statements()``,
+which wires together the full pipeline:
+
+    Phase 1 (auditor_signature_tool) → Phase 2 (classify_page_batches) → Phase 3 (this module)
+
+Phase 1 no longer does heuristic/TOC-based filtering — it locates the
+statutory auditor's signature page(s) via ``pipeline.phase1_filter_batch.
+auditor_signature_tool`` and leans on that tool's look-back to pull in the
+1-2 preceding pages, which is where the actual financial-statement numbers
+sit in Indian annual reports. That narrowed page set (re-read from the
+original source PDF, 0-indexed) is what gets handed to Phase 2.
+
+Phase 1's intermediate batch result is cached in ``gemini_cachelite``
+(SQLite, ``gemini_cachelite.sqlite3`` next to this module), keyed on the
+PDF's content hash plus the Phase 1 scan parameters — separate from Phase
+2's own Gemini-response cache (``gemini_cache.sqlite3``).
+
 Public surface
 --------------
     generate_output_pdf(source_pdf_path, output_pdf_path, page_mapping)
@@ -13,15 +30,17 @@ Public surface
     print_execution_summary(result)
         → None  (side-effect: pretty-printed JSON to stdout)
 
-    extract_core_financial_statements(pdf_path, output_path, api_key)
+    extract_core_financial_statements(pdf_path, output_path, api_key, ...)
         → OutputResult  (end-to-end master orchestrator)
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import sqlite3
 import sys
 import time
 from dataclasses import dataclass, field
@@ -33,9 +52,16 @@ import fitz  # PyMuPDF
 # ── Import Phase 1 & Phase 2 public APIs ─────────────────────────────────────
 # These modules must be importable from the same package / working directory.
 # Adjust the import paths to match your project layout if needed.
+#
+# Phase 1 is now the auditor-signature LangChain tool (pipeline/phase1_filter_batch.py).
+# It locates each statutory auditor's signature page in the source PDF and,
+# via its Stage-3 look-back, pulls in the 1-2 pages immediately preceding it
+# — which is where the actual financial-statement numbers live in Indian ARs.
+# That narrowed set of (page_number, text) pairs is what gets batched and
+# handed to Phase 2 for BS/PL/CF/EQ classification.
 try:
-    from pipeline.phase1_filter_batch import run_phase1          # type: ignore[import]
-    from pipeline.phase2_llm_classify import classify_page_batches  # type: ignore[import]
+    from pipeline.phase1_filter_batch import auditor_signature_tool        # type: ignore[import]
+    from pipeline.phase2_llm_classify import classify_page_batches          # type: ignore[import]
 except ModuleNotFoundError as _e:  # pragma: no cover
     raise ImportError(
         "Could not import Phase 1 / Phase 2 modules.  "
@@ -44,6 +70,90 @@ except ModuleNotFoundError as _e:  # pragma: no cover
     ) from _e
 
 log = logging.getLogger(__name__)
+
+# ── gemini_cachelite — Step1's own lightweight cache ──────────────────────────
+# Step1 does not call the Gemini API directly (that's Phase 2's job, cached
+# separately in gemini_cache.sqlite3). What Step1 DOES own is the expensive,
+# repeatable work of re-running the Phase 1 auditor-signature scan and
+# re-reading every page of the source PDF on every retry. gemini_cachelite
+# caches that intermediate result — the batches that get handed to Phase 2 —
+# keyed on the PDF's content hash plus the scan parameters, so re-running the
+# same PDF with the same Phase 1 settings skips straight to Phase 2.
+_DEFAULT_CACHELITE_PATH: Path = Path(__file__).resolve().parent / "gemini_cachelite.sqlite3"
+
+_CACHELITE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS gemini_cachelite (
+    cache_key    TEXT PRIMARY KEY,
+    pdf_path     TEXT NOT NULL,
+    min_score    INTEGER NOT NULL,
+    num_density  REAL NOT NULL,
+    batches_json TEXT NOT NULL,   -- the cached list[dict[int, str]] payload
+    created_at   REAL NOT NULL
+)
+"""
+
+
+def _get_cachelite_conn(cache_path: Path) -> sqlite3.Connection:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(cache_path))
+    conn.execute(_CACHELITE_SCHEMA)
+    conn.commit()
+    return conn
+
+
+def _hash_pdf_content(pdf_path: str) -> str:
+    """Content hash of the PDF bytes — invalidates automatically if the file changes."""
+    h = hashlib.sha256()
+    with open(pdf_path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _compute_cachelite_key(pdf_content_hash: str, min_score: int, num_density_pct: float) -> str:
+    """
+    Cache key covers the PDF's own bytes plus every Phase 1 scan parameter
+    that can change which pages get selected. Any change to min_score or
+    num_density_pct automatically invalidates the cached batch set.
+    """
+    raw = f"{pdf_content_hash}:{min_score}:{num_density_pct}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _cachelite_get(conn: sqlite3.Connection, cache_key: str) -> list[dict[int, str]] | None:
+    row = conn.execute(
+        "SELECT batches_json FROM gemini_cachelite WHERE cache_key = ?",
+        (cache_key,),
+    ).fetchone()
+    if row is None:
+        return None
+    # JSON object keys are always strings — convert page numbers back to int.
+    raw_batches: list[dict[str, str]] = json.loads(row[0])
+    return [{int(pg): text for pg, text in batch.items()} for batch in raw_batches]
+
+
+def _cachelite_set(
+    conn: sqlite3.Connection,
+    cache_key: str,
+    pdf_path: str,
+    min_score: int,
+    num_density_pct: float,
+    batches: list[dict[int, str]],
+) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO gemini_cachelite "
+        "(cache_key, pdf_path, min_score, num_density, batches_json, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            cache_key,
+            pdf_path,
+            min_score,
+            num_density_pct,
+            json.dumps(batches),
+            time.time(),
+        ),
+    )
+    conn.commit()
 
 # ── Category metadata (display order matters for the summary) ─────────────────
 _CATEGORY_META: dict[str, dict[str, str]] = {
@@ -326,27 +436,40 @@ def print_execution_summary(result: OutputResult) -> None:
 
 
 def extract_core_financial_statements(
-    pdf_path:    str,
-    output_path: str,
-    api_key:     str,
+    pdf_path:          str,
+    output_path:       str,
+    api_key:           str,
+    min_score:         int   = 7,
+    num_density_pct:   float = 10.0,
+    use_cachelite:     bool  = True,
+    cachelite_path:    Path | str = _DEFAULT_CACHELITE_PATH,
 ) -> OutputResult:
     """
     End-to-end pipeline: Phase 1 → Phase 2 → Phase 3.
 
-    Phase 1 — Heuristic Filtering & Token Batching
-        Opens the source PDF, extracts text from every page, runs a keyword
-        heuristic to shortlist candidate pages, then packs them into
-        token-bounded batches safe to send to the LLM.
+    Phase 1 — Auditor-Signature-Anchored Page Narrowing
+        Runs ``auditor_signature_tool`` against the source PDF to locate
+        the statutory auditor's signature page(s). Its built-in look-back
+        also pulls in the 1-2 pages immediately preceding each signature
+        page — in Indian ARs that's where the actual financial-statement
+        numbers (Balance Sheet / P&L / Cash Flow / Equity) live, since the
+        auditor signs directly below or after the statements. The matched
+        page numbers are then re-read from the ORIGINAL source PDF (not
+        the tool's repaginated side-output) so page numbering stays
+        consistent all the way through Phase 3, and packed into a single
+        token batch for Phase 2. The whole step is cached in
+        ``gemini_cachelite`` (see module docstring), keyed on the PDF's
+        content hash plus these scan parameters.
 
     Phase 2 — Structured LLM Classification
-        Sends each batch to the Gemini API and aggregates the ``[page, code]``
-        pairs into a ``ClassifiedPages`` object.  Pages the LLM marks ``XX``
-        (non-financial) are silently discarded here.
+        Sends the batch to the Gemini API and aggregates the
+        ``[page, code]`` pairs into a ``ClassifiedPages`` object. Pages
+        the LLM marks ``XX`` (non-financial) are silently discarded here.
 
     Phase 3 — Assembly & Output Generation
-        Collects the confirmed page numbers, sorts them, and writes a new PDF
-        containing only the four core financial statements.  Prints a JSON
-        execution summary on success.
+        Collects the confirmed page numbers, sorts them, and writes a new
+        PDF containing only the four core financial statements. Prints a
+        JSON execution summary on success.
 
     Parameters
     ----------
@@ -355,7 +478,20 @@ def extract_core_financial_statements(
     output_path : str
         Desired path for the generated financial-statements PDF.
     api_key : str
-        Gemini API key.
+        Gemini API key (passed through to Phase 2).
+    min_score : int
+        Phase 1 ``auditor_signature_tool`` Stage 1 minimum signature
+        confidence score, 0-19 (default: 7).
+    num_density_pct : float
+        Phase 1 ``auditor_signature_tool`` Stage 3 minimum digit-density
+        percentage to keep a page (default: 10.0).
+    use_cachelite : bool
+        If True (default), check ``gemini_cachelite`` for a cached Phase 1
+        batch before re-running the auditor-signature scan. Re-running the
+        same PDF with the same scan parameters becomes instant.
+    cachelite_path : Path | str
+        Path to the ``gemini_cachelite`` SQLite cache file. Defaults to
+        ``gemini_cachelite.sqlite3`` next to this module.
 
     Returns
     -------
@@ -369,7 +505,8 @@ def extract_core_financial_statements(
         If ``pdf_path`` does not exist.
     ImportError
         If Phase 1 or Phase 2 modules cannot be imported.
-    Any exception propagated from PyMuPDF or the Gemini HTTP client.
+    Any exception propagated from PyMuPDF, the auditor-signature tool, or
+    the Gemini HTTP client.
     """
     pipeline_start = time.perf_counter()
 
@@ -379,26 +516,86 @@ def extract_core_financial_statements(
     log.info("  Source PDF  : %s", pdf_path)
     log.info("  Output PDF  : %s", output_path)
 
-    # ── Phase 0: PDF Text Extraction ─────────────────────────────────────────
-    try:
-        source_doc = fitz.open(pdf_path)
-        pages: dict[int, str] = {
-            i: page.get_text("text") for i, page in enumerate(source_doc)
-        }
-        source_doc.close()
-    except Exception as e:
-        log.error("Failed to open or read PDF: %s", pdf_path)
-        raise e
-
-    log.info("  Extracted %d pages.", len(pages))
-
-    # ── Phase 1: Heuristic filter (active) & build token batches ─────────────
+    # ── Phase 1: Auditor-signature-anchored page narrowing ────────────────────
     log.info("-" * 65)
-    log.info("  PHASE 1 ─ Heuristic Filtering & Token Batching")
+    log.info("  PHASE 1 ─ Auditor-Signature-Anchored Page Narrowing")
     log.info("-" * 65)
 
-    phase1_result = run_phase1(pages)
-    batches: list[dict[int, str]] = [b.pages for b in phase1_result.batches]
+    cachelite_conn: sqlite3.Connection | None = None
+    cache_key: str | None = None
+    batches: list[dict[int, str]] = []
+
+    if use_cachelite:
+        cachelite_conn = _get_cachelite_conn(Path(cachelite_path))
+        pdf_hash = _hash_pdf_content(pdf_path)
+        cache_key = _compute_cachelite_key(pdf_hash, min_score, num_density_pct)
+        cached_batches = _cachelite_get(cachelite_conn, cache_key)
+        if cached_batches is not None:
+            log.info("  gemini_cachelite hit — skipping Phase 1 re-scan.")
+            batches = cached_batches
+
+    if not batches:
+        tool_result_json = auditor_signature_tool.invoke({
+            "pdf_path":         pdf_path,
+            "min_score":        min_score,
+            "num_density_pct":  num_density_pct,
+            "no_pdf":           True,   # Step1 only needs the match data, not a side PDF
+        })
+        tool_result = json.loads(tool_result_json)
+
+        if tool_result["status"] != "success":
+            log.error("Phase 1 auditor-signature scan failed: %s", tool_result.get("error"))
+            raise RuntimeError(
+                f"auditor_signature_tool failed: {tool_result.get('error')}"
+            )
+
+        matched_pages = sorted(m["page_number"] for m in tool_result["matches"])
+        log.info(
+            "  auditor_signature_tool matched %d page(s) (1-indexed): %s",
+            len(matched_pages), matched_pages,
+        )
+
+        if not matched_pages:
+            log.warning(
+                "Phase 1 found no auditor-signature pages — the PDF may not "
+                "contain a recognisable statutory auditor signature block. "
+                "Aborting pipeline."
+            )
+            return OutputResult(
+                output_pdf_path = output_path,
+                page_mapping    = {k: [] for k in _CATEGORY_META},
+                assembled_pages = [],
+                total_pages     = 0,
+            )
+
+        # ── Re-read the matched pages from the ORIGINAL source PDF ────────────
+        # auditor_signature_tool's page_number is 1-indexed into pdf_path.
+        # Phase 2 / Phase 3 expect 0-indexed page numbers into that same
+        # original PDF, so convert here and read text directly — we
+        # deliberately do NOT read from the tool's repaginated side-output.
+        try:
+            source_doc = fitz.open(pdf_path)
+            page_texts: dict[int, str] = {
+                pg - 1: source_doc[pg - 1].get_text("text")
+                for pg in matched_pages
+                if 0 <= pg - 1 < len(source_doc)
+            }
+            source_doc.close()
+        except Exception as e:
+            log.error("Failed to re-read matched pages from source PDF: %s", pdf_path)
+            raise e
+
+        # Single batch — Phase 1's narrowing already keeps this small relative
+        # to the full document, and Phase 2 takes list[dict[int, str]].
+        batches = [page_texts]
+
+        if use_cachelite and cachelite_conn is not None and cache_key is not None:
+            _cachelite_set(
+                cachelite_conn, cache_key, pdf_path, min_score, num_density_pct, batches,
+            )
+
+    if cachelite_conn is not None:
+        cachelite_conn.close()
 
     log.info(
         "  Phase 1 produced %d batch(es) covering %d candidate page(s).",
@@ -406,12 +603,10 @@ def extract_core_financial_statements(
         sum(len(b) for b in batches),
     )
 
-    if not batches:
+    if not batches or not any(batches):
         log.warning(
-            "Phase 1 returned zero batches — the PDF may contain no "
-            "financial-statement candidate pages.  Aborting pipeline."
+            "Phase 1 returned zero usable pages — aborting pipeline."
         )
-        # Return an empty result rather than crashing.
         return OutputResult(
             output_pdf_path = output_path,
             page_mapping    = {k: [] for k in _CATEGORY_META},

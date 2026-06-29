@@ -12,3 +12,5 @@ openpyxl
 rapidfuzz
 python-dotenv
 requests
+pdfplumber
+pypdf

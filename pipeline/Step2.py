@@ -19,9 +19,18 @@ Upgrades implemented
      objects before any Excel logic runs.
    • Consolidated pipelines carry `has_associates = True`, causing the
      algebra engine to prefer Equation C for PBT resolution.
+
+4. Hardened JSON Cache
+   • One JSON file per cache entry under output/step2_cache/, keyed on
+     sha256(model + prompt_template + extracted_pdf_text) instead of just
+     the PDF's filename — editing the extraction prompt, switching Gemini
+     models, or re-running against an edited PDF all produce automatic
+     cache misses rather than silently serving stale data. FORCE_REFRESH
+     remains available as an explicit manual override.
 """
 
 from google import genai as google_genai
+import hashlib
 import json
 import fitz
 import os
@@ -589,11 +598,9 @@ def clean_number(val):
     return val
 
 
-def call_gemini(text: str) -> list:
-    split_point = int(len(text) * 0.60)
-    chunks = [text[:split_point], text[split_point:]]
+_GEMINI_MODEL: str = "gemini-2.5-flash"
 
-    PROMPT = """Below is text from a financial statement PDF of an Indian company.
+_EXTRACTION_PROMPT_TEMPLATE = """Below is text from a financial statement PDF of an Indian company.
 Extract EVERY SINGLE LINE ITEM from ALL financial statements including Statement of Changes in Equity.
 You must extract BOTH Standalone and Consolidated statements and clearly segregate them.
 
@@ -631,12 +638,18 @@ STATEMENT CLASSIFICATION:
 PDF TEXT:
 {chunk}
 """
+
+
+def call_gemini(text: str) -> list:
+    split_point = int(len(text) * 0.60)
+    chunks = [text[:split_point], text[split_point:]]
+
     all_data = []
     for i, chunk in enumerate(chunks):
         print(f"  Sending chunk {i+1}/2 to Gemini...")
         response = gemini.models.generate_content(
-            model    = "gemini-2.5-flash",
-            contents = PROMPT.format(chunk=chunk),
+            model    = _GEMINI_MODEL,
+            contents = _EXTRACTION_PROMPT_TEMPLATE.format(chunk=chunk),
         )
         raw   = response.text
         clean = raw.replace("```json", "").replace("```", "").strip()
@@ -646,6 +659,48 @@ PDF TEXT:
         data = json.loads(clean)
         all_data.extend(data)
     return all_data
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CACHE LAYER — hardened JSON file cache
+# ─────────────────────────────────────────────────────────────────────────────
+# Mirrors phase2_llm_classify.py's cache-invalidation approach (content hash
+# of everything that can change the output) but keeps Step2's original
+# storage format: one plain JSON file per cache entry under output/.
+#
+# The cache key now covers:
+#   - the extracted PDF text itself (sha256) — a different/edited PDF misses
+#   - the prompt TEMPLATE text — editing call_gemini's PROMPT auto-invalidates
+#   - the model string — switching models auto-invalidates
+# This replaces the old pdf_stem-only key, which silently served stale
+# results after a prompt or model change unless FORCE_REFRESH was flipped
+# by hand.
+
+_CACHE_DIR_NAME = "step2_cache"
+
+
+def _compute_step2_cache_key(pdf_text: str, prompt_template: str, model: str) -> str:
+    """
+    Deterministic cache key: sha256(model + prompt_template + pdf_text).
+    Any change to the model, the prompt template, or the extracted PDF text
+    produces a different key, so the old entry is simply never looked up
+    again — no manual invalidation step required.
+    """
+    h = hashlib.sha256()
+    h.update(model.encode("utf-8"))
+    h.update(b"\x00")
+    h.update(prompt_template.encode("utf-8"))
+    h.update(b"\x00")
+    h.update(pdf_text.encode("utf-8"))
+    return h.hexdigest()
+
+
+def _step2_cache_path(cache_key: str) -> str:
+    cache_dir = os.path.join(_PROJECT_ROOT, "output", _CACHE_DIR_NAME)
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, f"{cache_key}.json")
+
+
 
 
 def truncate_financial_records(df: pd.DataFrame) -> pd.DataFrame:
@@ -1060,14 +1115,25 @@ def build_excel(df, output_path: str):
 
 def extract_financials(pdf_path: str, output_xlsx: str = "financials.xlsx"):
     pdf_stem = os.path.splitext(os.path.basename(pdf_path))[0]
-    cache_file = os.path.join(_PROJECT_ROOT, "output", f"{pdf_stem}_cache.json")
+
+    # ── Hardened cache key ────────────────────────────────────────────────────
+    # Old behaviour cached purely on pdf_stem, so editing the prompt or
+    # switching Gemini models silently kept serving a stale result unless
+    # FORCE_REFRESH was flipped by hand. The key now also hashes the
+    # extracted PDF text + the prompt template + the model string, so any
+    # of those changing produces a fresh cache miss automatically.
+    # FORCE_REFRESH remains as an explicit manual override on top of that.
+    pdf_text   = extract_text_from_pdf(pdf_path)
+    cache_key  = _compute_step2_cache_key(pdf_text, _EXTRACTION_PROMPT_TEMPLATE, _GEMINI_MODEL)
+    cache_file = _step2_cache_path(cache_key)
+
     if os.path.exists(cache_file) and not FORCE_REFRESH:
-        print("✅  Loading from cache — no API call needed...")
+        print(f"✅  Loading from cache ({pdf_stem}) — no API call needed...")
         with open(cache_file, "r") as f:
             all_data = json.load(f)
     else:
         print("Extracting text from PDF...")
-        all_data = call_gemini(extract_text_from_pdf(pdf_path))
+        all_data = call_gemini(pdf_text)
         with open(cache_file, "w") as f:
             json.dump(all_data, f, indent=2)
 
