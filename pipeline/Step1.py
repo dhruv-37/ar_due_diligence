@@ -379,22 +379,7 @@ def extract_core_financial_statements(
     log.info("  Source PDF  : %s", pdf_path)
     log.info("  Output PDF  : %s", output_path)
 
-    # ── Phase 0: PDF Text Extraction & Mock Scoring ───────────────────────────
-    # The run_phase1 function expects pre-extracted page text and a list of
-    # "scored" pages. The original code was missing this extraction step.
-    #
-    # Additionally, the scoring logic (originally in a separate module) is
-    # unavailable. We will create a mock PageScore object and a list that
-    # treats ALL pages as candidates, effectively bypassing the heuristic
-    # filter and sending them all to the LLM for classification.
-
-    @dataclass
-    class PageScore:
-        """A mock PageScore to stand in for the missing dependency."""
-        page_num: int
-        keyword_score: int = 99  # High enough to pass filter thresholds
-        table_density: float = 0.99  # High enough to pass filter thresholds
-
+    # ── Phase 0: PDF Text Extraction ─────────────────────────────────────────
     try:
         source_doc = fitz.open(pdf_path)
         pages: dict[int, str] = {
@@ -405,18 +390,14 @@ def extract_core_financial_statements(
         log.error("Failed to open or read PDF: %s", pdf_path)
         raise e
 
-    scored_pages: list[PageScore] = [PageScore(page_num=i) for i in pages]
-    log.info(
-        "  Extracted %d pages. Using mock scoring to pass all pages to Phase 1.",
-        len(pages)
-    )
+    log.info("  Extracted %d pages.", len(pages))
 
-    # ── Phase 1: Heuristic filter (bypassed) & build token batches ───────────
+    # ── Phase 1: Heuristic filter (active) & build token batches ─────────────
     log.info("-" * 65)
     log.info("  PHASE 1 ─ Heuristic Filtering & Token Batching")
     log.info("-" * 65)
 
-    phase1_result = run_phase1(pages, scored_pages)
+    phase1_result = run_phase1(pages)
     batches: list[dict[int, str]] = [b.pages for b in phase1_result.batches]
 
     log.info(
