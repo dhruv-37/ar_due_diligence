@@ -1,12 +1,12 @@
 """
 agents/red_flag_agent.py
 ========================
-Analyses financial ratios (computed from Excel + live FMP data) and
+Analyses financial ratios (computed from Excel + live yfinance data) and
 produces a structured list of red flags with severity ratings.
 
 Benchmarking approach
 ----------------------
-Wherever FMP can supply live peer data (via ratio_tool's stock_peers
+Wherever yfinance can supply live peer data (via ratio_tool's stock_peers
 lookup), flags are raised based on DEVIATION FROM THE LIVE PEER MEDIAN
 — not a fixed number. This means the same ROE, say, can be flagged for
 one company and not another, depending on what its actual sector peers
@@ -14,7 +14,7 @@ are doing *right now*. No static sector_medians.json, no hardcoded
 sector-to-number mapping.
 
 A small number of metrics (OCI/PAT, Exceptional items/PBT, Operating
-CF/PAT) have no FMP peer equivalent — these are accounting-quality
+CF/PAT) have no yfinance peer equivalent — these are accounting-quality
 signals about a SINGLE company's own statements, not something peers
 inherently bound. For those, a fixed rule-of-thumb threshold is used
 and explicitly labeled as such (see _FALLBACK_RULES below) so it's
@@ -22,12 +22,12 @@ never confused with a sector-aware benchmark.
 
 Red flag categories
 -------------------
-1. Profitability   — PAT margin, revenue growth, FMP net profit margin vs peers
+1. Profitability   — PAT margin, revenue growth, yfinance net profit margin vs peers
 2. Quality         — Operating CF / PAT (earnings quality) — fixed rule-of-thumb
 3. Leverage        — Debt/Equity, Interest Coverage vs peers
 4. OCI             — OCI / PAT ratio (aggressive OCI usage signal) — fixed rule-of-thumb
 5. Exceptional     — Exceptional items / PBT (one-time noise signal) — fixed rule-of-thumb
-6. Valuation       — P/E, ROE, ROA from FMP vs peers
+6. Valuation       — P/E, ROE, ROA from yfinance vs peers
 
 Severity levels
 ---------------
@@ -69,7 +69,7 @@ def _call_ratio_tool(ticker: str, xlsx_path: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FALLBACK RULES — only for metrics with no FMP peer equivalent.
+# FALLBACK RULES — only for metrics with no yfinance peer equivalent.
 # These are accounting-quality signals intrinsic to a company's own
 # statements (cash backing of earnings, OCI/exceptional-item noise),
 # not benchmarks that vary meaningfully by sector. Everything that
@@ -134,7 +134,7 @@ def _peer_relative_flag(metric: str, value: float, peer_median: float,
         f"median ({peer_median:.2f}).", severity)
 
 
-def detect_red_flags(computed: dict, fmp: dict, peer_benchmark: dict,
+def detect_red_flags(computed: dict, live: dict, peer_benchmark: dict,
                       peer_meta: dict) -> list[dict]:
     flags: list[dict] = []
 
@@ -143,7 +143,7 @@ def detect_red_flags(computed: dict, fmp: dict, peer_benchmark: dict,
 
     if peers_ok:
         peer_specs = [
-            # (fmp key, higher_is_better, label)
+            # (live key, higher_is_better, label)
             ("net_profit_margin",       True,  "Net profit margin"),
             ("operating_profit_margin", True,  "Operating profit margin"),
             ("roe",                     True,  "ROE"),
@@ -155,7 +155,7 @@ def detect_red_flags(computed: dict, fmp: dict, peer_benchmark: dict,
             ("pe_ratio",                None,  "P/E ratio"),  # informational, no direction
         ]
         for key, higher_is_better, label in peer_specs:
-            v = fmp.get(key)
+            v = live.get(key)
             pm = peer_benchmark.get(key)
             if v is None or pm is None or higher_is_better is None:
                 continue
@@ -170,7 +170,7 @@ def detect_red_flags(computed: dict, fmp: dict, peer_benchmark: dict,
             f"{peer_meta.get('status', 'unknown')}). Leverage/return/"
             f"valuation ratios were NOT benchmarked against peers.", "LOW"))
 
-    # ── Revenue Growth (no FMP peer equivalent for YoY growth; directional) ──
+    # ── Revenue Growth (no yfinance peer equivalent for YoY growth; directional) ──
     v = computed.get("revenue_growth_pct")
     if v is not None:
         if v < 0:
@@ -180,7 +180,7 @@ def detect_red_flags(computed: dict, fmp: dict, peer_benchmark: dict,
             flags.append(_flag("revenue_growth_pct", v,
                 f"Revenue grew {v:.1f}% — unusually high; verify organic vs inorganic.", "LOW"))
 
-    # ── PAT Margin: prefer peer comparison via FMP net_profit_margin; the
+    # ── PAT Margin: prefer peer comparison via yfinance net_profit_margin; the
     #    Excel-computed PAT margin itself has no live peer figure to compare
     #    against the company's *own* statements, so only flag extreme cases.
     v = computed.get("pat_margin_pct")
@@ -188,7 +188,7 @@ def detect_red_flags(computed: dict, fmp: dict, peer_benchmark: dict,
         flags.append(_flag("pat_margin_pct", v,
             f"PAT margin is negative ({v:.1f}%) — the company posted a loss.", "HIGH"))
 
-    # ── Earnings Quality (fallback rule — no FMP peer equivalent) ───────────
+    # ── Earnings Quality (fallback rule — no yfinance peer equivalent) ───────────
     v = computed.get("operating_cf_to_pat")
     fr = _FALLBACK_RULES["operating_cf_to_pat"]
     if v is not None:
@@ -201,7 +201,7 @@ def detect_red_flags(computed: dict, fmp: dict, peer_benchmark: dict,
                 f"Operating CF / PAT = {v:.2f} — unusually high; check working capital "
                 f"(fixed rule-of-thumb, not peer-benchmarked).", "LOW"))
 
-    # ── OCI Noise (fallback rule — no FMP peer equivalent) ──────────────────
+    # ── OCI Noise (fallback rule — no yfinance peer equivalent) ──────────────────
     v = computed.get("oci_to_pat_pct")
     fr = _FALLBACK_RULES["oci_to_pat_pct"]
     if v is not None and abs(v) > fr["warn"]:
@@ -209,7 +209,7 @@ def detect_red_flags(computed: dict, fmp: dict, peer_benchmark: dict,
             f"OCI is {v:.1f}% of PAT — aggressive OCI usage may mask true earnings "
             f"(fixed rule-of-thumb, not peer-benchmarked).", "MEDIUM"))
 
-    # ── Exceptional Items (fallback rule — no FMP peer equivalent) ─────────
+    # ── Exceptional Items (fallback rule — no yfinance peer equivalent) ─────────
     v = computed.get("exceptional_to_pbt_pct")
     fr = _FALLBACK_RULES["exceptional_to_pbt_pct"]
     if v is not None and abs(v) > fr["warn"]:
@@ -253,8 +253,8 @@ def detect_red_flags(computed: dict, fmp: dict, peer_benchmark: dict,
             f"operating cash flow — possible earnings manipulation or aggressive "
             f"accrual accounting.", "HIGH"))
 
-    roe = fmp.get("roe")
-    roa = fmp.get("roa")
+    roe = live.get("roe")
+    roa = live.get("roa")
     if de is not None and roe is not None and roa is not None and de > 1.5 and roa < 5 and roe > 15:
         flags.append(_flag("roe_leverage_driven", roe,
             f"ROE ({roe:.1f}%) looks healthy but ROA ({roa:.1f}%) is weak alongside "
@@ -284,12 +284,12 @@ def run_red_flag_agent(ticker: str, xlsx_path: str) -> dict:
     tool_output = _call_ratio_tool(ticker, xlsx_path)
 
     computed             = tool_output.get("computed", {})
-    fmp                  = tool_output.get("fmp", {})
+    live                 = tool_output.get("fmp", {})
     peer_benchmark       = tool_output.get("peer_benchmark", {})
     peer_benchmark_meta  = tool_output.get("peer_benchmark_meta", {})
     segment              = tool_output.get("segment", "Standalone")
 
-    red_flags = detect_red_flags(computed, fmp, peer_benchmark, peer_benchmark_meta)
+    red_flags = detect_red_flags(computed, live, peer_benchmark, peer_benchmark_meta)
 
     return {
         "ticker": ticker,
@@ -297,7 +297,7 @@ def run_red_flag_agent(ticker: str, xlsx_path: str) -> dict:
         "red_flags": red_flags,
         "ratios_used": {
             "computed": computed,
-            "fmp": fmp,
+            "live": live,
             "peer_benchmark": peer_benchmark,
             "peer_benchmark_meta": peer_benchmark_meta,
         },

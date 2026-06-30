@@ -300,9 +300,8 @@ def ratio_tool(ticker: str, xlsx_path: str) -> str:
             status            — "success" | "error"
             ticker            — ticker used
             computed          — ratios derived from Excel data
-            fmp               — company's own live ratios (sourced from
-                                 yfinance; key name kept as "fmp" for
-                                 backward compatibility with callers)
+            live               — company's own live ratios (sourced from
+                                 yfinance)
             peer_benchmark    — median of live peer ratios (may be {})
             peer_benchmark_meta — how the benchmark was derived: which
                                    peer tickers were used, how many had
@@ -347,7 +346,7 @@ def ratio_tool(ticker: str, xlsx_path: str) -> str:
         "status":              "success",
         "ticker":               ns_ticker,
         "computed":             computed,
-        "fmp":                  live_ratios,
+        "live":                  live_ratios,
         "peer_benchmark":       peer_benchmark,
         "peer_benchmark_meta":  peer_meta,
     })

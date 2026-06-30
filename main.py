@@ -36,7 +36,7 @@ def main():
     args = parser.parse_args()
 
     # ── Validate env ──────────────────────────────────────────────────────────
-    missing = [k for k in ["GEMINI_API_KEY", "FMP_API_KEY"] if not os.environ.get(k)]
+    missing = [k for k in ["GEMINI_API_KEY"] if not os.environ.get(k)]
     if missing:
         print(f"❌  Missing environment variables: {', '.join(missing)}")
         print("    Add them to your .env file.")
