@@ -42,8 +42,29 @@ def excel_reader_tool(xlsx_path: str) -> str:
         for sheet_name in xf.sheet_names:
             df = pd.read_excel(xf, sheet_name=sheet_name)
 
-            # Normalise column names to lowercase stripped strings
-            df.columns = [str(c).strip().lower() for c in df.columns]
+            # ── Smart Column Mapping ──────────────────────────────────────────
+            col_map = {}
+            year_cols = []
+            
+            for c in df.columns:
+                c_lower = str(c).strip().lower()
+                
+                if "line item" in c_lower or "line_item" in c_lower:
+                    col_map[c] = "line_item"
+                elif "taxonomy" in c_lower:
+                    col_map[c] = "taxonomy_node"
+                elif "fy" in c_lower or "20" in c_lower or "₹" in c_lower or "lakhs" in c_lower:
+                    # Catch financial year columns (e.g., 'FY25 (₹ Lakhs)')
+                    year_cols.append(c)
+
+            # Indian ARs traditionally list Current Year first, then Previous Year
+            if len(year_cols) >= 1:
+                col_map[year_cols[0]] = "current_year"
+            if len(year_cols) >= 2:
+                col_map[year_cols[1]] = "previous_year"
+
+            df.rename(columns=col_map, inplace=True)
+            # ──────────────────────────────────────────────────────────────────
 
             # Keep only the four core columns; fill missing ones with None
             core_cols = ["line_item", "current_year", "previous_year", "taxonomy_node"]

@@ -30,7 +30,7 @@ from pathlib import Path
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_community.vectorstores import Chroma
-from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langchain_classic.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools import tool
 
@@ -57,7 +57,7 @@ def _build_vectorstore(mda_text: str, pdf_stem: str, gemini_key: str) -> Chroma:
     persist_dir = str(Path(_VECTORSTORE_DIR) / pdf_stem)
 
     embeddings = GoogleGenerativeAIEmbeddings(
-        model="models/text-embedding-004",
+        model="models/embedding-001",
         google_api_key=gemini_key,
     )
 

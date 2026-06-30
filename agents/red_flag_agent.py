@@ -42,18 +42,30 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from langchain.agents import AgentExecutor, create_tool_calling_agent
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.tools import tool
-
 # ── Project root on sys.path ──────────────────────────────────────────────────
 _PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from tools.ratio_tool import ratio_tool
-from tools.excel_reader_tool import excel_reader_tool
+
+
+def _call_ratio_tool(ticker: str, xlsx_path: str) -> dict:
+    """
+    Invokes ratio_tool directly — no LLM/agent layer. Supports a plain
+    callable as well as a LangChain @tool-wrapped callable (which exposes
+    .func / .invoke rather than being directly callable with kwargs).
+    """
+    if hasattr(ratio_tool, "func"):
+        raw = ratio_tool.func(ticker=ticker, xlsx_path=xlsx_path)
+    elif hasattr(ratio_tool, "invoke"):
+        raw = ratio_tool.invoke({"ticker": ticker, "xlsx_path": xlsx_path})
+    else:
+        raw = ratio_tool(ticker=ticker, xlsx_path=xlsx_path)
+
+    if isinstance(raw, str):
+        raw = json.loads(raw)
+    return raw
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -137,7 +149,9 @@ def detect_red_flags(computed: dict, fmp: dict, peer_benchmark: dict,
             ("roe",                     True,  "ROE"),
             ("roa",                     True,  "ROA"),
             ("current_ratio",           True,  "Current ratio"),
+            ("quick_ratio",             True,  "Quick ratio"),
             ("debt_to_equity",          False, "Debt/Equity"),
+            ("interest_coverage",       True,  "Interest coverage"),
             ("pe_ratio",                None,  "P/E ratio"),  # informational, no direction
         ]
         for key, higher_is_better, label in peer_specs:
@@ -203,49 +217,62 @@ def detect_red_flags(computed: dict, fmp: dict, peer_benchmark: dict,
             f"Exceptional items = {v:.1f}% of PBT — one-time items distorting earnings "
             f"(fixed rule-of-thumb, not peer-benchmarked).", "MEDIUM"))
 
+    # ── Liquidity (absolute, intrinsic — solvency risk regardless of peers) ──
+    cr = computed.get("current_ratio")
+    if cr is not None and cr < 1.0:
+        flags.append(_flag("current_ratio", cr,
+            f"Current ratio = {cr:.2f} (<1.0) — current liabilities exceed current "
+            f"assets; short-term solvency risk.", "HIGH"))
+
+    # ── Leverage (absolute, intrinsic — independent of sector norms) ────────
+    de = computed.get("debt_to_equity")
+    if de is not None and de > 2.0:
+        flags.append(_flag("debt_to_equity", de,
+            f"Debt/Equity = {de:.2f} (>2.0) — high absolute leverage; elevated "
+            f"financial risk regardless of sector.", "HIGH"))
+
+    ic = computed.get("interest_coverage")
+    if ic is not None and ic < 1.5:
+        flags.append(_flag("interest_coverage", ic,
+            f"Interest coverage = {ic:.2f} (<1.5) — earnings barely cover interest "
+            f"obligations; default risk signal.", "HIGH"))
+
+    # ── Contradictory trends — internally inconsistent signals worth a flag ──
+    rg  = computed.get("revenue_growth_pct")
+    pm  = computed.get("pat_margin_pct")
+    pat_growth = computed.get("pat_growth_pct")
+    if rg is not None and pat_growth is not None and rg > 5 and pat_growth < 0:
+        flags.append(_flag("revenue_vs_pat_growth", pat_growth,
+            f"Revenue grew {rg:.1f}% YoY but PAT fell {abs(pat_growth):.1f}% — "
+            f"margin compression or one-off costs eroding profitability.", "MEDIUM"))
+
+    ocf_pat = computed.get("operating_cf_to_pat")
+    if pm is not None and ocf_pat is not None and pm > 0 and ocf_pat < 0:
+        flags.append(_flag("pat_vs_operating_cf", ocf_pat,
+            f"Company reports a positive PAT margin ({pm:.1f}%) but negative "
+            f"operating cash flow — possible earnings manipulation or aggressive "
+            f"accrual accounting.", "HIGH"))
+
+    roe = fmp.get("roe")
+    roa = fmp.get("roa")
+    if de is not None and roe is not None and roa is not None and de > 1.5 and roa < 5 and roe > 15:
+        flags.append(_flag("roe_leverage_driven", roe,
+            f"ROE ({roe:.1f}%) looks healthy but ROA ({roa:.1f}%) is weak alongside "
+            f"high Debt/Equity ({de:.2f}) — returns are leverage-driven, not "
+            f"operationally driven.", "MEDIUM"))
+
     return flags
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AGENT
+# ENTRY POINT  (deterministic — no LLM, no LangChain agent)
 # ─────────────────────────────────────────────────────────────────────────────
-
-_SYSTEM_PROMPT = """
-You are a senior financial analyst specialising in Indian listed companies.
-
-You have access to two tools:
-- ratio_tool      : fetches live FMP ratios + live peer benchmark + computes ratios from Excel
-- excel_reader_tool: reads the structured Excel file into sheet data
-
-Your job:
-1. Call ratio_tool with the ticker and xlsx_path provided by the user.
-2. Parse the JSON response, which includes "computed", "fmp",
-   "peer_benchmark", and "peer_benchmark_meta" keys.
-3. Return ONLY a valid JSON object with this exact structure:
-{{
-  "ticker": "<ticker>",
-  "segment": "<Standalone|Consolidated>",
-  "red_flags": [ {{ "metric": "", "value": 0, "message": "", "severity": "HIGH|MEDIUM|LOW" }} ],
-  "ratios_used": {{
-    "computed": {{}},
-    "fmp": {{}},
-    "peer_benchmark": {{}},
-    "peer_benchmark_meta": {{}}
-  }}
-}}
-Do not add any explanation outside the JSON.
-"""
-
-_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", _SYSTEM_PROMPT),
-    ("human", "{input}"),
-    ("placeholder", "{agent_scratchpad}"),
-])
-
 
 def run_red_flag_agent(ticker: str, xlsx_path: str) -> dict:
     """
-    Runs the Red Flag Agent and returns a structured dict of flags.
+    Runs the Red Flag rule engine and returns a structured dict of flags.
+    Calls ratio_tool directly (no LLM/agent layer involved) and applies
+    the deterministic rule engine in detect_red_flags().
 
     Args:
         ticker:    NSE ticker without suffix, e.g. "RELIANCE"
@@ -254,55 +281,27 @@ def run_red_flag_agent(ticker: str, xlsx_path: str) -> dict:
     Returns:
         dict with keys: ticker, segment, red_flags, ratios_used
     """
-    gemini_key = os.environ.get("GEMINI_API_KEY")
-    if not gemini_key:
-        raise EnvironmentError("GEMINI_API_KEY not set.")
+    tool_output = _call_ratio_tool(ticker, xlsx_path)
 
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",  # gemini-2.0-flash retired ~June 2026 — was hardcoded to a dead model
-        google_api_key=gemini_key,
-        temperature=0,
-    )
+    computed             = tool_output.get("computed", {})
+    fmp                  = tool_output.get("fmp", {})
+    peer_benchmark       = tool_output.get("peer_benchmark", {})
+    peer_benchmark_meta  = tool_output.get("peer_benchmark_meta", {})
+    segment              = tool_output.get("segment", "Standalone")
 
-    tools = [ratio_tool, excel_reader_tool]
-    agent = create_tool_calling_agent(llm, tools, _PROMPT)
-    executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+    red_flags = detect_red_flags(computed, fmp, peer_benchmark, peer_benchmark_meta)
 
-    user_input = (
-        f"Analyse financial red flags for ticker={ticker}, "
-        f"xlsx_path={xlsx_path}. "
-        f"Call ratio_tool first, then return the structured JSON."
-    )
-
-    raw = executor.invoke({"input": user_input})
-    output = raw.get("output", "{}")
-
-    # ── Parse LLM JSON output ─────────────────────────────────────────────────
-    try:
-        result = json.loads(output)
-    except json.JSONDecodeError:
-        # LLM sometimes wraps in ```json ... ```
-        import re
-        match = re.search(r"\{.*\}", output, re.DOTALL)
-        result = json.loads(match.group()) if match else {"error": output}
-
-    # ── Run deterministic rule engine on top of LLM result ───────────────────
-    # This ensures flags are never missed even if LLM hallucinates
-    ratios_used        = result.get("ratios_used", {})
-    computed            = ratios_used.get("computed", {})
-    fmp                 = ratios_used.get("fmp", {})
-    peer_benchmark      = ratios_used.get("peer_benchmark", {})
-    peer_benchmark_meta = ratios_used.get("peer_benchmark_meta", {})
-
-    deterministic_flags = detect_red_flags(computed, fmp, peer_benchmark, peer_benchmark_meta)
-
-    # Merge: deduplicate by metric, prefer deterministic over LLM
-    existing_metrics = {f["metric"] for f in result.get("red_flags", [])}
-    for flag in deterministic_flags:
-        if flag["metric"] not in existing_metrics:
-            result.setdefault("red_flags", []).append(flag)
-
-    return result
+    return {
+        "ticker": ticker,
+        "segment": segment,
+        "red_flags": red_flags,
+        "ratios_used": {
+            "computed": computed,
+            "fmp": fmp,
+            "peer_benchmark": peer_benchmark,
+            "peer_benchmark_meta": peer_benchmark_meta,
+        },
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
