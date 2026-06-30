@@ -172,6 +172,15 @@ List every red flag with its severity. If none, say "No red flags identified."
 Format each as:
 - **[SEVERITY]** `metric`: message
 
+When a red flag is peer-relative (its message references a "peer median"),
+check the Peer Context data below before treating the deviation as a pure
+quality signal: if the company's business mix differs materially from its
+listed peer tickers (e.g. a diversified conglomerate benchmarked against
+single-segment peers), say so explicitly and temper the interpretation
+accordingly rather than presenting the deviation at face value.
+
+Peer Context: {peer_context}
+
 ## 4. Narrative vs Numbers
 List claim verdicts. Group by verdict type (CONFIRMED / OVERSTATED / UNDERSTATED / UNVERIFIABLE).
 If narrative analysis was skipped, explain why.
@@ -213,6 +222,16 @@ def node_write_memo(state: PipelineState) -> dict:
         "error": state.get("red_flags", {}).get("error"),
     }
 
+    # ── Peer context (so the LLM can judge whether peer-relative flags are
+    #    distorted by business-mix differences, e.g. a diversified
+    #    conglomerate benchmarked against single-segment peers) ──────────────
+    ratios_used = state.get("red_flags", {}).get("ratios_used", {})
+    peer_context = {
+        "segment":             ratios_used.get("computed", {}).get("segment"),
+        "peer_tickers":        ratios_used.get("peer_benchmark_meta", {}).get("peer_tickers", []),
+        "peer_benchmark_status": ratios_used.get("peer_benchmark_meta", {}).get("status"),
+    }
+
     narrative_summary = {
         "summary":  state.get("narrative", {}).get("summary"),
         "verdicts": state.get("narrative", {}).get("verdicts", [])[:20],  # cap at 20
@@ -220,10 +239,11 @@ def node_write_memo(state: PipelineState) -> dict:
     }
 
     prompt = _MEMO_PROMPT.format(
-        ticker     = state["ticker"],
-        extraction = json.dumps(extraction_summary, indent=2),
-        red_flags  = json.dumps(red_flags_summary,  indent=2),
-        narrative  = json.dumps(narrative_summary,  indent=2),
+        ticker       = state["ticker"],
+        extraction   = json.dumps(extraction_summary, indent=2),
+        red_flags    = json.dumps(red_flags_summary,  indent=2),
+        narrative    = json.dumps(narrative_summary,  indent=2),
+        peer_context = json.dumps(peer_context,        indent=2),
     )
 
     response  = llm.invoke(prompt)

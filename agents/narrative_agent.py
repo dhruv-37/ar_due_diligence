@@ -149,23 +149,87 @@ _METRIC_TO_NODE = {
     "eps":                      "EARNINGS_PER_SHARE",
 }
 
+# Maps metric names LLM might use → alias phrase lists used to locate the
+# matching line_item in the extracted Excel sheets. Replaces the previous
+# taxonomy_node lookup — Step2's Excel has no taxonomy_node column, so that
+# lookup always returned None and every claim came back UNVERIFIABLE.
+_METRIC_TO_ALIASES: dict[str, list[str]] = {
+    "REVENUE_FROM_OPERATIONS": [
+        "revenue from operations", "value of sales", "net sales", "revenue",
+    ],
+    "PROFIT_FOR_THE_YEAR": [
+        "profit for the year", "profit after tax", "net profit", "pat",
+    ],
+    "PROFIT_BEFORE_TAX": [
+        "profit before tax and exceptional items", "profit before tax", "pbt",
+    ],
+    "TOTAL_INCOME": [
+        "total income",
+    ],
+    "PROFIT_BEFORE_EXCEPTIONAL": [
+        "profit before exceptional items and tax",
+        "profit before share of profit of associates and tax",
+        "profit before exceptional item and tax",
+    ],
+    "NET_CASH_FROM_OPERATING": [
+        "net cash from operating activities",
+        "net cash generated from operating activities",
+        "net cash flow from operating activities",
+        "cash flow from operating activities",
+    ],
+    "EARNINGS_PER_SHARE": [
+        "basic and diluted", "earnings per equity share", "basic", "diluted",
+    ],
+}
+
 _TOLERANCE = 0.02  # 2% tolerance for CONFIRMED verdict
 
 
+def _normalize_line_item(text: str) -> str:
+    """Lowercase, strip punctuation, collapse whitespace for fuzzy matching."""
+    s = str(text or "").lower()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _safe_float(val):
+    try:
+        f = float(val)
+        return f if f == f else None  # NaN check
+    except (TypeError, ValueError):
+        return None
+
+
 def _find_actual(node: str, sheets: dict) -> tuple[float | None, float | None]:
-    """Returns (current_year, previous_year) for a taxonomy node from sheets."""
-    for prefix in ["Standalone", "Consolidated"]:
-        for stmt_suffix in ["P&L", "Balance Sheet", "Cash Flow", "Changes in Equity"]:
-            sheet_name = f"{prefix} - {stmt_suffix}"
-            records = sheets.get(sheet_name, [])
-            for r in records:
-                if str(r.get("taxonomy_node", "")).upper() == node:
-                    cur  = r.get("current_year")
-                    prev = r.get("previous_year")
-                    try:
-                        return float(cur), float(prev) if prev is not None else None
-                    except (TypeError, ValueError):
-                        continue
+    """
+    Returns (current_year, previous_year) for a metric, searching the
+    canonical sheet keys ('standalone_pnl', 'standalone_cash_flow', etc.
+    — see excel_reader_tool._canonical_sheet_name) and matching line_item
+    text against the alias list for `node`, alias-priority-first and
+    skipping rows with no usable value (mirrors ratio_tool._find_by_alias).
+    """
+    aliases = _METRIC_TO_ALIASES.get(node, [])
+    if not aliases:
+        return None, None
+
+    for prefix in ["standalone", "consolidated"]:
+        for stmt_key in ["pnl", "balance_sheet", "cash_flow", "equity"]:
+            records = sheets.get(f"{prefix}_{stmt_key}", [])
+            if not records:
+                continue
+            for alias in aliases:
+                for r in records:
+                    if _normalize_line_item(r.get("line_item")) == alias:
+                        cur = _safe_float(r.get("current_year"))
+                        if cur is not None:
+                            return cur, _safe_float(r.get("previous_year"))
+            for alias in aliases:
+                for r in records:
+                    if alias in _normalize_line_item(r.get("line_item")):
+                        cur = _safe_float(r.get("current_year"))
+                        if cur is not None:
+                            return cur, _safe_float(r.get("previous_year"))
     return None, None
 
 

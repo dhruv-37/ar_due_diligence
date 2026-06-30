@@ -1,14 +1,15 @@
 """
 tools/ratio_tool.py
 ===================
-Fetches live fundamental ratios for an Indian listed company from the
-Financial Modeling Prep (FMP) API, finds live sector/market-cap peers
-via FMP, and returns the company's ratios alongside a peer-median
-benchmark — computed fresh every run, never from a static file.
+Fetches live fundamental ratios for an Indian listed company from Yahoo
+Finance (via yfinance — free, no API key required), finds sector peers
+from a curated NSE peer-ticker map, and returns the company's ratios
+alongside a peer-median benchmark computed fresh every run from LIVE
+per-peer data (only the peer *ticker membership* is curated — every
+ratio value, including the peer median, is fetched live, never hardcoded).
 
-FMP endpoints used:
-    /api/v3/ratios/{ticker}?limit=1&apikey={key}
-    /api/v4/stock_peers?symbol={ticker}&apikey={key}
+Switched from Financial Modeling Prep (FMP) because FMP's free/low tiers
+return HTTP 403 on the /ratios and /stock_peers endpoints for NSE tickers.
 
 Ticker format: RELIANCE.NS  (NSE-listed stocks)
 
@@ -16,43 +17,50 @@ Computed ratios (from Excel):
     revenue_growth_pct, pat_margin_pct, ebitda_margin_pct,
     operating_cf_to_pat, oci_to_pat_pct, exceptional_to_pbt_pct
 
-FMP ratios (live, per company):
-    pe_ratio, debt_to_equity, current_ratio, roe, roa,
+Live ratios (per company, via yfinance):
+    pe_ratio, debt_to_equity, current_ratio, quick_ratio, roe, roa,
     operating_profit_margin, net_profit_margin
 
 Peer benchmark (live, computed per run):
-    For each FMP ratio above, the median value across live peers
-    returned by FMP's stock_peers endpoint. No hardcoded sector
-    list, no static JSON file — if FMP can't resolve peers (plan
-    tier, missing NSE coverage, etc.) this comes back empty and
-    the caller is told explicitly via `peer_benchmark_status`.
+    For each ratio above, the median value across live peers resolved
+    from _SECTOR_PEER_TICKERS (keyed by yfinance's reported sector/
+    industry string). If the company's sector isn't in the map, or none
+    of the curated peers return usable data, this comes back empty and
+    the caller is told explicitly via peer_benchmark_meta.status.
 """
 
 import json
-import os
+import re
 import statistics
-import urllib.request
-import urllib.error
 from pathlib import Path
 
 import pandas as pd
+import yfinance as yf
 from langchain.tools import tool
+from tools.excel_reader_tool import excel_reader_tool
 
-FMP_BASE_V3 = "https://financialmodelingprep.com/api/v3"
-FMP_BASE_V4 = "https://financialmodelingprep.com/api/v4"
-
-# Max peers to query ratios for — keeps latency/quota sane, not a benchmark value
+# Max peers to query ratios for — keeps latency sane, not a benchmark value
 _MAX_PEERS = 6
 
-
-def _fmp_get(url: str) -> dict | list | None:
-    try:
-        with urllib.request.urlopen(url, timeout=10) as resp:
-            return json.loads(resp.read().decode())
-    except urllib.error.HTTPError as e:
-        return {"fmp_error": f"HTTP {e.code}: {e.reason}"}
-    except Exception as e:
-        return {"fmp_error": str(e)}
+# Curated NSE peer-ticker sets keyed by a lowercase substring of yfinance's
+# 'sector' / 'industry' field. Only TICKER MEMBERSHIP is hardcoded here —
+# every ratio for every peer is still fetched live via yfinance below, so
+# this is not a static sector_medians.json equivalent.
+_SECTOR_PEER_TICKERS: dict[str, list[str]] = {
+    "energy":          ["ONGC.NS", "BPCL.NS", "IOC.NS", "HINDPETRO.NS", "GAIL.NS"],
+    "information technology": ["TCS.NS", "INFY.NS", "WIPRO.NS", "HCLTECH.NS", "TECHM.NS"],
+    "technology":      ["TCS.NS", "INFY.NS", "WIPRO.NS", "HCLTECH.NS", "TECHM.NS"],
+    "financial":       ["HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS", "KOTAKBANK.NS", "AXISBANK.NS"],
+    "bank":            ["HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS", "KOTAKBANK.NS", "AXISBANK.NS"],
+    "consumer defensive": ["HINDUNILVR.NS", "ITC.NS", "NESTLEIND.NS", "BRITANNIA.NS", "DABUR.NS"],
+    "household":       ["HINDUNILVR.NS", "ITC.NS", "NESTLEIND.NS", "BRITANNIA.NS", "DABUR.NS"],
+    "auto":            ["MARUTI.NS", "TATAMOTORS.NS", "M&M.NS", "BAJAJ-AUTO.NS", "EICHERMOT.NS"],
+    "pharma":          ["SUNPHARMA.NS", "DRREDDY.NS", "CIPLA.NS", "DIVISLAB.NS", "LUPIN.NS"],
+    "drug":            ["SUNPHARMA.NS", "DRREDDY.NS", "CIPLA.NS", "DIVISLAB.NS", "LUPIN.NS"],
+    "steel":           ["TATASTEEL.NS", "JSWSTEEL.NS", "HINDALCO.NS", "VEDL.NS", "SAIL.NS"],
+    "metal":           ["TATASTEEL.NS", "JSWSTEEL.NS", "HINDALCO.NS", "VEDL.NS", "SAIL.NS"],
+    "telecom":         ["BHARTIARTL.NS", "IDEA.NS"],
+}
 
 
 def _safe(val, default=None):
@@ -64,45 +72,63 @@ def _safe(val, default=None):
         return default
 
 
-def _fetch_company_ratios(ns_ticker: str, api_key: str) -> dict:
-    """Fetch a single company's live FMP ratios. Returns {} on failure."""
-    raw = _fmp_get(f"{FMP_BASE_V3}/ratios/{ns_ticker}?limit=1&apikey={api_key}")
-    if not (isinstance(raw, list) and raw):
+def _fetch_company_ratios(ns_ticker: str) -> dict:
+    """
+    Fetch a single company's live ratios via yfinance. Returns {} on
+    failure (delisted ticker, network error, no fundamentals available).
+    """
+    try:
+        info = yf.Ticker(ns_ticker).info
+    except Exception:
         return {}
-    r = raw[0]
+
+    if not info or info.get("trailingPE") is None and info.get("regularMarketPrice") is None:
+        return {}
+
+    # yfinance reports debtToEquity as a percentage (e.g. 41.2 == 0.412
+    # ratio) — normalise to a plain ratio to match the rest of the codebase
+    # (e.g. red_flag_agent's absolute D/E > 2.0 check).
+    de_raw = _safe(info.get("debtToEquity"))
+    debt_to_equity = round(de_raw / 100, 4) if de_raw is not None else None
+
     return {
-        "pe_ratio":                _safe(r.get("priceEarningsRatio")),
-        "debt_to_equity":          _safe(r.get("debtEquityRatio")),
-        "current_ratio":           _safe(r.get("currentRatio")),
-        "roe":                     _safe(r.get("returnOnEquity")),
-        "roa":                     _safe(r.get("returnOnAssets")),
-        "operating_profit_margin": _safe(r.get("operatingProfitMargin")),
-        "net_profit_margin":       _safe(r.get("netProfitMargin")),
+        "pe_ratio":                _safe(info.get("trailingPE")),
+        "debt_to_equity":          debt_to_equity,
+        "current_ratio":           _safe(info.get("currentRatio")),
+        "quick_ratio":             _safe(info.get("quickRatio")),
+        "roe":                     _safe(info.get("returnOnEquity")),
+        "roa":                     _safe(info.get("returnOnAssets")),
+        "operating_profit_margin": _safe(info.get("operatingMargins")),
+        "net_profit_margin":       _safe(info.get("profitMargins")),
     }
 
 
-def _fetch_peer_tickers(ns_ticker: str, api_key: str) -> list[str]:
+def _fetch_peer_tickers(ns_ticker: str) -> list[str]:
     """
-    Calls FMP's stock_peers endpoint (same exchange, sector, market-cap band).
-    Returns [] if unavailable — caller must treat that as "no peer data",
-    not silently fall back to a fixed number.
+    Resolves sector/market-cap peers via the curated _SECTOR_PEER_TICKERS
+    map, keyed by yfinance's reported sector/industry for this ticker.
+    Returns [] if the sector can't be resolved or isn't mapped — caller
+    must treat that as "no peer data", not silently use a fixed number.
     """
-    raw = _fmp_get(f"{FMP_BASE_V4}/stock_peers?symbol={ns_ticker}&apikey={api_key}")
-    if isinstance(raw, dict) and "fmp_error" in raw:
+    try:
+        info = yf.Ticker(ns_ticker).info
+    except Exception:
         return []
-    if isinstance(raw, list) and raw:
-        peers = raw[0].get("peersList", []) if isinstance(raw[0], dict) else []
-        return [p for p in peers if isinstance(p, str)][:_MAX_PEERS]
+
+    haystack = f"{info.get('sector', '')} {info.get('industry', '')}".lower()
+    for key, peers in _SECTOR_PEER_TICKERS.items():
+        if key in haystack:
+            return [p for p in peers if p != ns_ticker][:_MAX_PEERS]
     return []
 
 
-def _peer_median_ratios(ns_ticker: str, api_key: str) -> tuple[dict, dict]:
+def _peer_median_ratios(ns_ticker: str) -> tuple[dict, dict]:
     """
-    Returns (peer_medians, meta) where peer_medians maps each FMP ratio
-    name to the live median across resolved peers, and meta describes
-    how the benchmark was obtained (for transparency to the caller).
+    Returns (peer_medians, meta) where peer_medians maps each ratio name
+    to the live median across resolved peers, and meta describes how the
+    benchmark was obtained (for transparency to the caller).
     """
-    peer_tickers = _fetch_peer_tickers(ns_ticker, api_key)
+    peer_tickers = _fetch_peer_tickers(ns_ticker)
     meta = {"peer_tickers": peer_tickers, "peers_with_data": 0, "status": "ok"}
 
     if not peer_tickers:
@@ -111,7 +137,7 @@ def _peer_median_ratios(ns_ticker: str, api_key: str) -> tuple[dict, dict]:
 
     per_peer_ratios = []
     for peer in peer_tickers:
-        ratios = _fetch_company_ratios(peer, api_key)
+        ratios = _fetch_company_ratios(peer)
         if ratios:
             per_peer_ratios.append(ratios)
 
@@ -121,8 +147,8 @@ def _peer_median_ratios(ns_ticker: str, api_key: str) -> tuple[dict, dict]:
         return {}, meta
 
     medians = {}
-    for key in ["pe_ratio", "debt_to_equity", "current_ratio", "roe",
-                "roa", "operating_profit_margin", "net_profit_margin"]:
+    for key in ["pe_ratio", "debt_to_equity", "current_ratio", "quick_ratio",
+                "roe", "roa", "operating_profit_margin", "net_profit_margin"]:
         vals = [p[key] for p in per_peer_ratios if p.get(key) is not None]
         if vals:
             medians[key] = round(statistics.median(vals), 4)
@@ -130,51 +156,129 @@ def _peer_median_ratios(ns_ticker: str, api_key: str) -> tuple[dict, dict]:
     return medians, meta
 
 
+
+# ── Line-item alias matching (replaces taxonomy_node, which Step2's Excel
+#    does not produce) ────────────────────────────────────────────────────
+def _normalize_line_item(text: str) -> str:
+    """Lowercase, strip punctuation, collapse whitespace for fuzzy matching."""
+    s = str(text or "").lower()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+# Each metric maps to a list of normalized alias phrases (longest/most
+# specific first where overlap is possible).
+_LINE_ITEM_ALIASES = {
+    "REVENUE": [
+        "revenue from operations", "value of sales", "net sales", "revenue",
+    ],
+    "PROFIT_BEFORE_TAX": [
+        "profit before tax and exceptional items", "profit before tax", "pbt",
+    ],
+    "PROFIT_AFTER_TAX": [
+        "profit for the year", "profit after tax", "net profit", "pat",
+    ],
+    "TOTAL_OCI": [
+        "total other comprehensive income", "other comprehensive income", "oci",
+    ],
+    "EXCEPTIONAL_ITEMS": [
+        "exceptional items", "exceptional item",
+    ],
+    "OPERATING_CASH_FLOW": [
+        "net cash from operating activities",
+        "net cash generated from operating activities",
+        "cash flow from operating activities",
+        "net cash flow from operating activities",
+    ],
+}
+
+
+def _find_by_alias(records: list, metric: str):
+    """
+    Scans a sheet's records for a line_item matching an alias of `metric`.
+    Returns (current_year, previous_year) as floats, or (None, None) if
+    no usable match is found — never raises, so missing metrics are
+    skipped gracefully.
+
+    Matching strategy (fixes two real-data issues found in testing):
+    1. Iterate ALIASES first, records second — so a more specific alias
+       (e.g. "revenue from operations") is preferred over a less specific
+       one (e.g. "revenue") even if the less-specific row appears earlier
+       in the sheet (e.g. "Value of Sales" appearing before "Revenue from
+       Operations").
+    2. Skip rows whose current_year is not a usable number — Indian ARs
+       often have section-header rows (e.g. "Other Comprehensive Income")
+       with blank values immediately above the real total row (e.g.
+       "Total Other Comprehensive Income ... (Net of Tax)"); these blank
+       headers must not shadow the real total.
+    """
+    aliases = _LINE_ITEM_ALIASES.get(metric, [])
+
+    # Pass 1: exact normalized match, alias-priority order, value required
+    for alias in aliases:
+        for r in records:
+            if _normalize_line_item(r.get("line_item")) == alias:
+                cur = _safe(r.get("current_year"))
+                if cur is not None:
+                    return cur, _safe(r.get("previous_year"))
+
+    # Pass 2: substring match, alias-priority order, value required
+    for alias in aliases:
+        for r in records:
+            if alias in _normalize_line_item(r.get("line_item")):
+                cur = _safe(r.get("current_year"))
+                if cur is not None:
+                    return cur, _safe(r.get("previous_year"))
+
+    return None, None
+
+
 def _compute_ratios(sheets: dict) -> dict:
     """
-    Derive key ratios from the extracted Excel sheets.
+    Derive key ratios from the extracted Excel sheets using normalized
+    line_item alias matching (no taxonomy_node dependency).
     Tries Standalone first, falls back to Consolidated.
     """
     ratios = {}
 
-    # ── helper: find value by taxonomy_node in a sheet record list ───────────
-    def find(records: list, node: str):
-        for r in records:
-            if str(r.get("taxonomy_node", "")).upper() == node:
-                return _safe(r.get("current_year")), _safe(r.get("previous_year"))
-        return None, None
+    if "standalone_pnl" in sheets:
+        pl = sheets["standalone_pnl"]
+        cf = sheets.get("standalone_cash_flow", [])
+        prefix = "Standalone"
+    elif "consolidated_pnl" in sheets:
+        pl = sheets["consolidated_pnl"]
+        cf = sheets.get("consolidated_cash_flow", [])
+        prefix = "Consolidated"
+    else:
+        return ratios
 
-    for prefix in ["Standalone", "Consolidated"]:
-        pl  = sheets.get(f"{prefix} - P&L", [])
-        cf  = sheets.get(f"{prefix} - Cash Flow", [])
+    ratios["segment"] = prefix
+    if not pl:
+        return ratios
 
-        if not pl:
-            continue
+    # ── Alias-based lookups (replaces taxonomy_node lookups) ────────────────
+    rev_cur,  rev_prev = _find_by_alias(pl, "REVENUE")
+    pat_cur,  _         = _find_by_alias(pl, "PROFIT_AFTER_TAX")
+    pbt_cur,  _         = _find_by_alias(pl, "PROFIT_BEFORE_TAX")
+    oci_cur,  _         = _find_by_alias(pl, "TOTAL_OCI")
+    exc_cur,  _         = _find_by_alias(pl, "EXCEPTIONAL_ITEMS")
+    cfo_cur,  _         = _find_by_alias(cf, "OPERATING_CASH_FLOW")
 
-        rev_cur,  rev_prev  = find(pl, "REVENUE_FROM_OPERATIONS")
-        pat_cur,  _         = find(pl, "PROFIT_FOR_THE_YEAR")
-        pbt_cur,  _         = find(pl, "PROFIT_BEFORE_TAX")
-        oci_cur,  _         = find(pl, "TOTAL_OCI")
-        exc_cur,  _         = find(pl, "EXCEPTIONAL_ITEMS")
-        cfo_cur,  _         = find(cf, "NET_CASH_FROM_OPERATING")
+    if rev_cur and rev_prev and rev_prev != 0:
+        ratios["revenue_growth_pct"] = round((rev_cur - rev_prev) / abs(rev_prev) * 100, 2)
 
-        if rev_cur and rev_prev and rev_prev != 0:
-            ratios["revenue_growth_pct"] = round((rev_cur - rev_prev) / abs(rev_prev) * 100, 2)
+    if pat_cur and rev_cur and rev_cur != 0:
+        ratios["pat_margin_pct"] = round(pat_cur / rev_cur * 100, 2)
 
-        if pat_cur and rev_cur and rev_cur != 0:
-            ratios["pat_margin_pct"] = round(pat_cur / rev_cur * 100, 2)
+    if pat_cur and cfo_cur and pat_cur != 0:
+        ratios["operating_cf_to_pat"] = round(cfo_cur / pat_cur, 2)
 
-        if pat_cur and cfo_cur and pat_cur != 0:
-            ratios["operating_cf_to_pat"] = round(cfo_cur / pat_cur, 2)
+    if oci_cur and pat_cur and pat_cur != 0:
+        ratios["oci_to_pat_pct"] = round(oci_cur / pat_cur * 100, 2)
 
-        if oci_cur and pat_cur and pat_cur != 0:
-            ratios["oci_to_pat_pct"] = round(oci_cur / pat_cur * 100, 2)
-
-        if exc_cur and pbt_cur and pbt_cur != 0:
-            ratios["exceptional_to_pbt_pct"] = round(exc_cur / pbt_cur * 100, 2)
-
-        ratios["segment"] = prefix
-        break  # use first segment that has data
+    if exc_cur and pbt_cur and pbt_cur != 0:
+        ratios["exceptional_to_pbt_pct"] = round(exc_cur / pbt_cur * 100, 2)
 
     return ratios
 
@@ -182,10 +286,10 @@ def _compute_ratios(sheets: dict) -> dict:
 @tool
 def ratio_tool(ticker: str, xlsx_path: str) -> str:
     """
-    Fetches live FMP ratios for an NSE-listed stock, computes additional
-    ratios from the extracted Excel file, and benchmarks the company's
-    FMP ratios against the LIVE median of its FMP-resolved sector/market-cap
-    peers (no static thresholds, no hardcoded peer list).
+    Fetches live ratios for an NSE-listed stock via yfinance, computes
+    additional ratios from the extracted Excel file, and benchmarks the
+    company's ratios against the LIVE median of its sector peers (peer
+    ticker membership is curated; every ratio value is fetched live).
 
     Args:
         ticker:     NSE ticker symbol, e.g. "RELIANCE" (without .NS suffix).
@@ -196,7 +300,9 @@ def ratio_tool(ticker: str, xlsx_path: str) -> str:
             status            — "success" | "error"
             ticker            — ticker used
             computed          — ratios derived from Excel data
-            fmp               — company's own live ratios from FMP API
+            fmp               — company's own live ratios (sourced from
+                                 yfinance; key name kept as "fmp" for
+                                 backward compatibility with callers)
             peer_benchmark    — median of live peer ratios (may be {})
             peer_benchmark_meta — how the benchmark was derived: which
                                    peer tickers were used, how many had
@@ -207,51 +313,41 @@ def ratio_tool(ticker: str, xlsx_path: str) -> str:
                                    "peers_found_but_no_ratio_data".
             error             — error message (only on failure)
     """
-    api_key = os.environ.get("FMP_API_KEY")
-    if not api_key:
-        return json.dumps({"status": "error", "error": "FMP_API_KEY not set in environment."})
-
     xlsx_path = str(Path(xlsx_path).resolve())
     if not Path(xlsx_path).exists():
         return json.dumps({"status": "error", "error": f"Excel file not found: {xlsx_path}"})
 
     # ── Load Excel ────────────────────────────────────────────────────────────
     try:
-        xf = pd.ExcelFile(xlsx_path)
-        sheets = {}
-        for sheet_name in xf.sheet_names:
-            df = pd.read_excel(xf, sheet_name=sheet_name)
-            df.columns = [str(c).strip().lower() for c in df.columns]
-            core = ["line_item", "current_year", "previous_year", "taxonomy_node"]
-            for col in core:
-                if col not in df.columns:
-                    df[col] = None
-            df = df[core].dropna(subset=["line_item"])
-            if not df.empty:
-                sheets[sheet_name] = df.where(pd.notna(df), other=None).to_dict(orient="records")
+        result = json.loads(excel_reader_tool.invoke({"xlsx_path": xlsx_path}))
+
+        print("\n===== EXCEL READER RESULT =====")
+        print(result)
+
+        if result["status"] != "success":
+            return json.dumps(result)
+
+        sheets = result["sheets"]
+
     except Exception as exc:
         return json.dumps({"status": "error", "error": f"Excel read failed: {exc}"})
-
     # ── Computed ratios from Excel ────────────────────────────────────────────
     computed = _compute_ratios(sheets)
 
-    # ── FMP live ratios for this company ─────────────────────────────────────
+    # ── Live ratios for this company (via yfinance) ──────────────────────────
     ns_ticker = f"{ticker.upper()}.NS"
-    fmp_ratios = _fetch_company_ratios(ns_ticker, api_key)
-    if not fmp_ratios:
-        # Could be a real API error — surface it instead of silently empty
-        raw = _fmp_get(f"{FMP_BASE_V3}/ratios/{ns_ticker}?limit=1&apikey={api_key}")
-        if isinstance(raw, dict) and "fmp_error" in raw:
-            fmp_ratios = raw
+    live_ratios = _fetch_company_ratios(ns_ticker)
+    if not live_ratios:
+        live_ratios = {"fetch_error": f"No usable yfinance data for {ns_ticker}."}
 
-    # ── Live peer benchmark (replaces static sector_medians.json) ───────────
-    peer_benchmark, peer_meta = _peer_median_ratios(ns_ticker, api_key)
+    # ── Live peer benchmark ──────────────────────────────────────────────────
+    peer_benchmark, peer_meta = _peer_median_ratios(ns_ticker)
 
     return json.dumps({
         "status":              "success",
         "ticker":               ns_ticker,
         "computed":             computed,
-        "fmp":                  fmp_ratios,
+        "fmp":                  live_ratios,
         "peer_benchmark":       peer_benchmark,
         "peer_benchmark_meta":  peer_meta,
     })
