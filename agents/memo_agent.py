@@ -246,8 +246,9 @@ def node_write_memo(state: PipelineState) -> dict:
         peer_context = json.dumps(peer_context,        indent=2),
     )
 
-    response  = llm.invoke(prompt)
-    memo_text = response.content if hasattr(response, "content") else str(response)
+    from tools.llm_cache import cached_invoke
+    response  = cached_invoke(llm, prompt, "gemini-2.5-flash")
+    memo_text = response.content
 
     # ── Write memo to output/ ─────────────────────────────────────────────────
     pdf_stem  = Path(state["pdf_path"]).stem

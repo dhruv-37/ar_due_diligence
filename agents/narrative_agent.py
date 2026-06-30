@@ -27,9 +27,7 @@ import re
 import sys
 from pathlib import Path
 
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from langchain_community.vectorstores import Chroma
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_classic.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools import tool
@@ -41,49 +39,6 @@ if _PROJECT_ROOT not in sys.path:
 
 from tools.mda_extractor_tool import mda_extractor_tool
 from tools.excel_reader_tool import excel_reader_tool
-
-_VECTORSTORE_DIR = str(Path(_PROJECT_ROOT) / "data" / "vectorstore")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# VECTOR STORE BUILDER
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _build_vectorstore(mda_text: str, pdf_stem: str, gemini_key: str) -> Chroma:
-    """
-    Chunks MD&A text and embeds into a persistent Chroma vector store.
-    Re-uses existing store if already built for this PDF stem.
-    """
-    persist_dir = str(Path(_VECTORSTORE_DIR) / pdf_stem)
-
-    embeddings = GoogleGenerativeAIEmbeddings(
-        model="models/embedding-001",
-        google_api_key=gemini_key,
-    )
-
-    # Re-use existing store
-    if Path(persist_dir).exists():
-        print(f"  ✅ Loading existing vectorstore for {pdf_stem}")
-        return Chroma(
-            persist_directory=persist_dir,
-            embedding_function=embeddings,
-        )
-
-    print(f"  🔨 Building vectorstore for {pdf_stem}...")
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=800,
-        chunk_overlap=100,
-        separators=["\n\n", "\n", ".", " "],
-    )
-    chunks = splitter.split_text(mda_text)
-
-    store = Chroma.from_texts(
-        texts=chunks,
-        embedding=embeddings,
-        persist_directory=persist_dir,
-    )
-    print(f"  ✅ Vectorstore built — {len(chunks)} chunks indexed.")
-    return store
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -201,19 +156,24 @@ def _safe_float(val):
         return None
 
 
-def _find_actual(node: str, sheets: dict) -> tuple[float | None, float | None]:
+def _find_actual(node: str, sheets: dict, scope: str | None = None) -> tuple[float | None, float | None]:
     """
     Returns (current_year, previous_year) for a metric, searching the
     canonical sheet keys ('standalone_pnl', 'standalone_cash_flow', etc.
     — see excel_reader_tool._canonical_sheet_name) and matching line_item
     text against the alias list for `node`, alias-priority-first and
     skipping rows with no usable value (mirrors ratio_tool._find_by_alias).
+
+    `scope` restricts the search to 'standalone' or 'consolidated' if the
+    claim text says so explicitly — prevents cross-matching e.g. a
+    consolidated revenue claim against the standalone PnL row.
     """
     aliases = _METRIC_TO_ALIASES.get(node, [])
     if not aliases:
         return None, None
 
-    for prefix in ["standalone", "consolidated"]:
+    prefixes = [scope] if scope in ("standalone", "consolidated") else ["standalone", "consolidated"]
+    for prefix in prefixes:
         for stmt_key in ["pnl", "balance_sheet", "cash_flow", "equity"]:
             records = sheets.get(f"{prefix}_{stmt_key}", [])
             if not records:
@@ -244,10 +204,30 @@ def _verify_claim(claim: dict, sheets: dict) -> dict:
 
     node = _METRIC_TO_NODE.get(metric)
     if not node:
+        # LLM sometimes prefixes/suffixes metric names (e.g.
+        # "consolidated_revenue_growth_pct", "standalone_pat") that don't
+        # exact-match _METRIC_TO_NODE. Strip known scope prefixes/suffixes
+        # and retry, then fall back to substring matching.
+        stripped = re.sub(r"^(standalone|consolidated)_", "", metric)
+        stripped = re.sub(r"_(standalone|consolidated)$", "", stripped)
+        node = _METRIC_TO_NODE.get(stripped)
+        if not node:
+            for key, mapped_node in _METRIC_TO_NODE.items():
+                if key in stripped or stripped in key:
+                    node = mapped_node
+                    break
+    if not node:
         return {**claim, "verdict": "UNVERIFIABLE", "actual_value": None,
                 "delta_pct": None, "note": f"No taxonomy mapping for metric '{metric}'"}
 
-    cur, prev = _find_actual(node, sheets)
+    claim_text = _normalize_line_item(claim.get("claim_text", ""))
+    scope = None
+    if "consolidated" in claim_text:
+        scope = "consolidated"
+    elif "standalone" in claim_text:
+        scope = "standalone"
+
+    cur, prev = _find_actual(node, sheets, scope)
 
     if cur is None:
         return {**claim, "verdict": "UNVERIFIABLE", "actual_value": None,
@@ -328,11 +308,7 @@ def run_narrative_agent(pdf_path: str, xlsx_path: str) -> dict:
     pdf_stem   = Path(pdf_path).stem
     print(f"  ✅ MD&A extracted — pages {mda_result['start_page']}–{mda_result['end_page']}")
 
-    # ── Step 2: Build / load vector store ────────────────────────────────────
-    print("\n── Narrative Agent: Building vector store...")
-    _build_vectorstore(mda_text, pdf_stem, gemini_key)
-
-    # ── Step 3: Extract claims from MD&A via LLM ─────────────────────────────
+    # ── Step 2: Extract claims from MD&A via LLM ─────────────────────────────
     print("\n── Narrative Agent: Extracting quantitative claims from MD&A...")
     claims = _extract_claims(mda_text, llm)
     print(f"  ✅ {len(claims)} claims extracted.")

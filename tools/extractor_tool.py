@@ -35,7 +35,8 @@ def extract_financials_tool(pdf_path: str, output_xlsx: str = "") -> str:
         trimmed_pdf = str(Path(pdf_path).parent / f"{input_stem}_trimmed.pdf")
 
         print(f"\n── Step 1: Extracting core financial pages → {trimmed_pdf}")
-        extract_core_financial_statements(pdf_path, trimmed_pdf, gemini_key)
+        step1_result = extract_core_financial_statements(pdf_path, trimmed_pdf, gemini_key)
+        total_pages = getattr(step1_result, "total_pages", None) if step1_result is not None else None
 
         if not output_xlsx:
             output_dir = Path(_PROJECT_ROOT) / "output"
@@ -45,7 +46,7 @@ def extract_financials_tool(pdf_path: str, output_xlsx: str = "") -> str:
         print(f"\n── Step 2: Parsing & building Excel → {output_xlsx}")
         extract_financials(trimmed_pdf, output_xlsx)
 
-        return json.dumps({"status": "ok", "output_xlsx": output_xlsx})
+        return json.dumps({"status": "ok", "output_xlsx": output_xlsx, "total_pages": total_pages})
 
     except Exception as exc:
         return json.dumps({"status": "error", "error": str(exc)})
