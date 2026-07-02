@@ -39,6 +39,7 @@ if _PROJECT_ROOT not in sys.path:
 
 from tools.mda_extractor_tool import mda_extractor_tool
 from tools.excel_reader_tool import excel_reader_tool
+from tools.llm_cache import cached_invoke
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -83,190 +84,113 @@ def _extract_claims(mda_text: str, llm: ChatGoogleGenerativeAI) -> list[dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLAIM VERIFIER  (deterministic — compares claims against Excel numbers)
+# CLAIM VERIFIER  (LLM-driven — LLM reads raw sheet snippets and the claim,
+# extracts the number itself, computes, and returns the verdict. No Python-side
+# metric/alias matching — that was silently mis-extracting values like
+# consolidated revenue and producing wrong verdicts.)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Maps metric names LLM might use → taxonomy nodes in Excel
-_METRIC_TO_NODE = {
-    "revenue":                  "REVENUE_FROM_OPERATIONS",
-    "revenue_growth":           "REVENUE_FROM_OPERATIONS",
-    "revenue_growth_pct":       "REVENUE_FROM_OPERATIONS",
-    "profit":                   "PROFIT_FOR_THE_YEAR",
-    "pat":                      "PROFIT_FOR_THE_YEAR",
-    "net_profit":               "PROFIT_FOR_THE_YEAR",
-    "profit_growth_pct":        "PROFIT_FOR_THE_YEAR",
-    "pbt":                      "PROFIT_BEFORE_TAX",
-    "profit_before_tax":        "PROFIT_BEFORE_TAX",
-    "total_income":             "TOTAL_INCOME",
-    "ebitda":                   "PROFIT_BEFORE_EXCEPTIONAL",
-    "cash_flow":                "NET_CASH_FROM_OPERATING",
-    "operating_cash_flow":      "NET_CASH_FROM_OPERATING",
-    "eps":                      "EARNINGS_PER_SHARE",
-}
-
-# Maps metric names LLM might use → alias phrase lists used to locate the
-# matching line_item in the extracted Excel sheets. Replaces the previous
-# taxonomy_node lookup — Step2's Excel has no taxonomy_node column, so that
-# lookup always returned None and every claim came back UNVERIFIABLE.
-_METRIC_TO_ALIASES: dict[str, list[str]] = {
-    "REVENUE_FROM_OPERATIONS": [
-        "revenue from operations", "value of sales", "net sales", "revenue",
+# Keyword prefilter: claim text/metric → which statement(s) to send.
+# Keeps the prompt small by only sending sheets relevant to the claim,
+# instead of dumping the full workbook for every claim.
+_STMT_KEYWORDS = {
+    "pnl": [
+        "revenue", "sales", "income", "profit", "pat", "pbt", "ebitda",
+        "margin", "expense", "cost", "eps", "earnings", "tax",
     ],
-    "PROFIT_FOR_THE_YEAR": [
-        "profit for the year", "profit after tax", "net profit", "pat",
+    "balance_sheet": [
+        "asset", "liabilit", "debt", "borrowing", "equity", "networth",
+        "net worth", "reserve", "capital employed",
     ],
-    "PROFIT_BEFORE_TAX": [
-        "profit before tax and exceptional items", "profit before tax", "pbt",
+    "cash_flow": [
+        "cash flow", "cash generated", "cash from operating",
+        "investing activities", "financing activities", "free cash flow",
     ],
-    "TOTAL_INCOME": [
-        "total income",
-    ],
-    "PROFIT_BEFORE_EXCEPTIONAL": [
-        "profit before exceptional items and tax",
-        "profit before share of profit of associates and tax",
-        "profit before exceptional item and tax",
-    ],
-    "NET_CASH_FROM_OPERATING": [
-        "net cash from operating activities",
-        "net cash generated from operating activities",
-        "net cash flow from operating activities",
-        "cash flow from operating activities",
-    ],
-    "EARNINGS_PER_SHARE": [
-        "basic and diluted", "earnings per equity share", "basic", "diluted",
+    "equity": [
+        "shareholding", "share capital", "dividend", "buyback",
     ],
 }
 
-_TOLERANCE = 0.02  # 2% tolerance for CONFIRMED verdict
 
+def _prefilter_sheets(claim: dict, sheets: dict) -> dict:
+    """Returns only the sheet snippets relevant to this claim's keywords.
+    Falls back to all sheets if nothing matches (avoids starving the LLM
+    of data on unmapped keywords)."""
+    text = f"{claim.get('claim_text', '')} {claim.get('metric', '')}".lower()
 
-def _normalize_line_item(text: str) -> str:
-    """Lowercase, strip punctuation, collapse whitespace for fuzzy matching."""
-    s = str(text or "").lower()
-    s = re.sub(r"[^a-z0-9\s]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-def _safe_float(val):
-    try:
-        f = float(val)
-        return f if f == f else None  # NaN check
-    except (TypeError, ValueError):
-        return None
-
-
-def _find_actual(node: str, sheets: dict, scope: str | None = None) -> tuple[float | None, float | None]:
-    """
-    Returns (current_year, previous_year) for a metric, searching the
-    canonical sheet keys ('standalone_pnl', 'standalone_cash_flow', etc.
-    — see excel_reader_tool._canonical_sheet_name) and matching line_item
-    text against the alias list for `node`, alias-priority-first and
-    skipping rows with no usable value (mirrors ratio_tool._find_by_alias).
-
-    `scope` restricts the search to 'standalone' or 'consolidated' if the
-    claim text says so explicitly — prevents cross-matching e.g. a
-    consolidated revenue claim against the standalone PnL row.
-    """
-    aliases = _METRIC_TO_ALIASES.get(node, [])
-    if not aliases:
-        return None, None
-
-    prefixes = [scope] if scope in ("standalone", "consolidated") else ["standalone", "consolidated"]
-    for prefix in prefixes:
-        for stmt_key in ["pnl", "balance_sheet", "cash_flow", "equity"]:
-            records = sheets.get(f"{prefix}_{stmt_key}", [])
-            if not records:
-                continue
-            for alias in aliases:
-                for r in records:
-                    if _normalize_line_item(r.get("line_item")) == alias:
-                        cur = _safe_float(r.get("current_year"))
-                        if cur is not None:
-                            return cur, _safe_float(r.get("previous_year"))
-            for alias in aliases:
-                for r in records:
-                    if alias in _normalize_line_item(r.get("line_item")):
-                        cur = _safe_float(r.get("current_year"))
-                        if cur is not None:
-                            return cur, _safe_float(r.get("previous_year"))
-    return None, None
-
-
-def _verify_claim(claim: dict, sheets: dict) -> dict:
-    """
-    Compares a single management claim against extracted numbers.
-    Returns a verdict dict.
-    """
-    metric   = str(claim.get("metric", "")).lower()
-    cl_value = claim.get("value")
-    unit     = claim.get("unit", "")
-
-    node = _METRIC_TO_NODE.get(metric)
-    if not node:
-        # LLM sometimes prefixes/suffixes metric names (e.g.
-        # "consolidated_revenue_growth_pct", "standalone_pat") that don't
-        # exact-match _METRIC_TO_NODE. Strip known scope prefixes/suffixes
-        # and retry, then fall back to substring matching.
-        stripped = re.sub(r"^(standalone|consolidated)_", "", metric)
-        stripped = re.sub(r"_(standalone|consolidated)$", "", stripped)
-        node = _METRIC_TO_NODE.get(stripped)
-        if not node:
-            for key, mapped_node in _METRIC_TO_NODE.items():
-                if key in stripped or stripped in key:
-                    node = mapped_node
-                    break
-    if not node:
-        return {**claim, "verdict": "UNVERIFIABLE", "actual_value": None,
-                "delta_pct": None, "note": f"No taxonomy mapping for metric '{metric}'"}
-
-    claim_text = _normalize_line_item(claim.get("claim_text", ""))
     scope = None
-    if "consolidated" in claim_text:
+    if "consolidated" in text:
         scope = "consolidated"
-    elif "standalone" in claim_text:
+    elif "standalone" in text:
         scope = "standalone"
+    prefixes = [scope] if scope else ["standalone", "consolidated"]
 
-    cur, prev = _find_actual(node, sheets, scope)
+    stmt_keys = [k for k, kws in _STMT_KEYWORDS.items() if any(kw in text for kw in kws)]
+    if not stmt_keys:
+        stmt_keys = list(_STMT_KEYWORDS.keys())
 
-    if cur is None:
-        return {**claim, "verdict": "UNVERIFIABLE", "actual_value": None,
-                "delta_pct": None, "note": f"Node {node} not found in extracted data"}
+    snippet = {}
+    for prefix in prefixes:
+        for stmt_key in stmt_keys:
+            sheet_name = f"{prefix}_{stmt_key}"
+            records = sheets.get(sheet_name)
+            if records:
+                snippet[sheet_name] = records
 
-    # For growth % claims, compute actual YoY growth
-    if "growth" in metric and prev and prev != 0:
-        actual = (cur - prev) / abs(prev) * 100
-    else:
-        actual = cur
+    return snippet if snippet else sheets
 
-    if cl_value is None:
-        return {**claim, "verdict": "UNVERIFIABLE", "actual_value": actual,
-                "delta_pct": None, "note": "No numeric value in claim"}
+
+_COMPARE_PROMPT = """You are a financial analyst verifying a management claim from an Indian
+Annual Report's MD&A against the company's actual reported financial statements.
+
+Claim:
+{claim_json}
+
+Relevant extracted Excel sheet data (raw rows: line_item, current_year, previous_year):
+{sheets_json}
+
+Instructions:
+- Find the correct line item(s) yourself from the sheet data — do not assume any
+  Python-side mapping is correct. Watch for standalone vs consolidated scope.
+- Do the calculation yourself (growth %, margin, etc. as needed).
+- Compare your computed actual value against the claimed value (2% tolerance = CONFIRMED).
+- Also weigh in qualitatively where relevant — e.g. if the number is technically
+  overstated/understated but explainable by market conditions, competitive
+  dynamics, business model shifts, one-offs, etc., reflect that nuance in your note
+  rather than a flat pass/fail. Don't force every verdict into the same tone.
+
+Return ONLY JSON, no markdown fences:
+{{
+  "verdict": "CONFIRMED" | "OVERSTATED" | "UNDERSTATED" | "UNVERIFIABLE",
+  "actual_value": <float or null>,
+  "delta_pct": <float or null>,
+  "note": "<your reasoning, including any qualitative/contextual color>"
+}}
+"""
+
+
+def _llm_compare(claim: dict, sheets_snippet: dict, llm: ChatGoogleGenerativeAI, model_name: str) -> dict:
+    """Sends claim + raw sheet snippets to the LLM and lets it extract, compute,
+    and verdict in one shot. Cached via cached_invoke (key = model + full prompt,
+    i.e. keyed on the LLM comparison result, not raw sheet extraction)."""
+    prompt = _COMPARE_PROMPT.format(
+        claim_json=json.dumps(claim, ensure_ascii=False),
+        sheets_json=json.dumps(sheets_snippet, ensure_ascii=False)[:20000],
+    )
+    response = cached_invoke(llm, prompt, model_name)
+    raw = response.content if hasattr(response, "content") else str(response)
 
     try:
-        cl_float = float(cl_value)
-        if cl_float == 0:
-            delta_pct = 0.0
-        else:
-            delta_pct = (actual - cl_float) / abs(cl_float)
-    except (TypeError, ValueError):
-        return {**claim, "verdict": "UNVERIFIABLE", "actual_value": actual,
-                "delta_pct": None, "note": "Could not parse claim value as float"}
+        clean = re.sub(r"```json|```", "", raw).strip()
+        result = json.loads(clean)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        result = json.loads(match.group()) if match else {
+            "verdict": "UNVERIFIABLE", "actual_value": None,
+            "delta_pct": None, "note": "LLM response could not be parsed",
+        }
 
-    if abs(delta_pct) <= _TOLERANCE:
-        verdict = "CONFIRMED"
-    elif delta_pct < 0:
-        verdict = "OVERSTATED"   # actual < claimed
-    else:
-        verdict = "UNDERSTATED"  # actual > claimed
-
-    return {
-        **claim,
-        "verdict":      verdict,
-        "actual_value": round(actual, 2),
-        "delta_pct":    round(delta_pct * 100, 2),
-        "note":         f"Actual={actual:.2f} vs Claimed={cl_float:.2f} ({unit})",
-    }
+    return {**claim, **result}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -321,9 +245,13 @@ def run_narrative_agent(pdf_path: str, xlsx_path: str) -> dict:
 
     sheets = excel_result["sheets"]
 
-    # ── Step 5: Verify each claim ─────────────────────────────────────────────
-    print("\n── Narrative Agent: Verifying claims against extracted numbers...")
-    verdicts = [_verify_claim(claim, sheets) for claim in claims]
+    # ── Step 5: Verify each claim via LLM ─────────────────────────────────────
+    print("\n── Narrative Agent: Verifying claims against extracted numbers (LLM)...")
+    model_name = "gemini-2.5-flash"
+    verdicts = [
+        _llm_compare(claim, _prefilter_sheets(claim, sheets), llm, model_name)
+        for claim in claims
+    ]
 
     # ── Summary ───────────────────────────────────────────────────────────────
     summary = {
