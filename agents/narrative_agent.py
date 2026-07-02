@@ -140,57 +140,79 @@ def _prefilter_sheets(claim: dict, sheets: dict) -> dict:
     return snippet if snippet else sheets
 
 
-_COMPARE_PROMPT = """You are a financial analyst verifying a management claim from an Indian
+_COMPARE_PROMPT_BATCH = """You are a financial analyst verifying management claims from an Indian
 Annual Report's MD&A against the company's actual reported financial statements.
 
-Claim:
-{claim_json}
+Claims to verify (verify EACH one independently — do not let one claim's numbers
+bleed into another's):
+{claims_json}
 
 Relevant extracted Excel sheet data (raw rows: line_item, current_year, previous_year):
 {sheets_json}
 
 Instructions:
-- Find the correct line item(s) yourself from the sheet data — do not assume any
-  Python-side mapping is correct. Watch for standalone vs consolidated scope.
-- Do the calculation yourself (growth %, margin, etc. as needed).
+- For EACH claim, find the correct line item(s) yourself from the sheet data — do not
+  assume any Python-side mapping is correct. Watch for standalone vs consolidated scope.
+- Do the calculation yourself (growth %, margin, etc. as needed) separately per claim.
 - Compare your computed actual value against the claimed value (2% tolerance = CONFIRMED).
-- Also weigh in qualitatively where relevant — e.g. if the number is technically
+- Also weigh in qualitatively where relevant — e.g. if a number is technically
   overstated/understated but explainable by market conditions, competitive
-  dynamics, business model shifts, one-offs, etc., reflect that nuance in your note
+  dynamics, business model shifts, one-offs, etc., reflect that nuance in the note
   rather than a flat pass/fail. Don't force every verdict into the same tone.
 
-Return ONLY JSON, no markdown fences:
-{{
-  "verdict": "CONFIRMED" | "OVERSTATED" | "UNDERSTATED" | "UNVERIFIABLE",
-  "actual_value": <float or null>,
-  "delta_pct": <float or null>,
-  "note": "<your reasoning, including any qualitative/contextual color>"
-}}
+Return ONLY a JSON array with exactly {n} elements, one per claim, in the SAME ORDER
+as the claims above, no markdown fences:
+[
+  {{
+    "verdict": "CONFIRMED" | "OVERSTATED" | "UNDERSTATED" | "UNVERIFIABLE",
+    "actual_value": <float or null>,
+    "delta_pct": <float or null>,
+    "note": "<your reasoning, including any qualitative/contextual color>"
+  }}
+]
 """
 
 
-def _llm_compare(claim: dict, sheets_snippet: dict, llm: ChatGoogleGenerativeAI, model_name: str) -> dict:
-    """Sends claim + raw sheet snippets to the LLM and lets it extract, compute,
-    and verdict in one shot. Cached via cached_invoke (key = model + full prompt,
-    i.e. keyed on the LLM comparison result, not raw sheet extraction)."""
-    prompt = _COMPARE_PROMPT.format(
-        claim_json=json.dumps(claim, ensure_ascii=False),
-        sheets_json=json.dumps(sheets_snippet, ensure_ascii=False)[:20000],
+def _llm_compare_batch(claims_batch: list[dict], sheets: dict, llm: ChatGoogleGenerativeAI, model_name: str) -> list[dict]:
+    """Sends a batch of claims (default 8) + the union of their relevant sheet
+    snippets to the LLM in a single call, and gets back a JSON array of verdicts
+    in the same order. Cached via cached_invoke, keyed on the full batch prompt.
+    Cuts request count by ~8x vs. one call per claim."""
+    union_snippet: dict = {}
+    for claim in claims_batch:
+        union_snippet.update(_prefilter_sheets(claim, sheets))
+
+    prompt = _COMPARE_PROMPT_BATCH.format(
+        claims_json=json.dumps(claims_batch, ensure_ascii=False, indent=2),
+        sheets_json=json.dumps(union_snippet, ensure_ascii=False)[:20000],
+        n=len(claims_batch),
     )
     response = cached_invoke(llm, prompt, model_name)
     raw = response.content if hasattr(response, "content") else str(response)
 
     try:
         clean = re.sub(r"```json|```", "", raw).strip()
-        result = json.loads(clean)
+        results = json.loads(clean)
     except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", raw, re.DOTALL)
-        result = json.loads(match.group()) if match else {
-            "verdict": "UNVERIFIABLE", "actual_value": None,
-            "delta_pct": None, "note": "LLM response could not be parsed",
-        }
+        match = re.search(r"\[.*\]", raw, re.DOTALL)
+        results = json.loads(match.group()) if match else []
 
-    return {**claim, **result}
+    if not isinstance(results, list):
+        results = []
+
+    # Align results to claims 1:1. If the LLM under/over-returns or returns a
+    # malformed element, that claim falls back to UNVERIFIABLE instead of
+    # taking down the whole batch.
+    out = []
+    for i, claim in enumerate(claims_batch):
+        result = results[i] if i < len(results) and isinstance(results[i], dict) else None
+        if result is None:
+            result = {
+                "verdict": "UNVERIFIABLE", "actual_value": None,
+                "delta_pct": None, "note": "Batch LLM response missing/malformed for this claim",
+            }
+        out.append({**claim, **result})
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -220,6 +242,7 @@ def run_narrative_agent(pdf_path: str, xlsx_path: str) -> dict:
         model="gemini-2.5-flash",  # gemini-2.0-flash retired ~June 2026 — was hardcoded to a dead model
         google_api_key=gemini_key,
         temperature=0,
+        max_retries=1,  # was defaulting to 2 — each 429 near quota ceiling was costing 3x billed attempts
     )
 
     # ── Step 1: Extract MD&A text ─────────────────────────────────────────────
@@ -237,6 +260,15 @@ def run_narrative_agent(pdf_path: str, xlsx_path: str) -> dict:
     claims = _extract_claims(mda_text, llm)
     print(f"  ✅ {len(claims)} claims extracted.")
 
+    # Cap to the most material claims (by absolute value) — fewer claims means
+    # fewer batches on top of the batching itself, and 56 raw claims is more
+    # than we need to cross-check for a due diligence read.
+    MAX_CLAIMS = 20
+    if len(claims) > MAX_CLAIMS:
+        original_count = len(claims)
+        claims = sorted(claims, key=lambda c: abs(c.get("value") or 0), reverse=True)[:MAX_CLAIMS]
+        print(f"  ⚠️  Capped {original_count} claims → top {MAX_CLAIMS} by materiality.")
+
     # ── Step 4: Load Excel sheets ─────────────────────────────────────────────
     print("\n── Narrative Agent: Loading Excel data...")
     excel_result = json.loads(excel_reader_tool.invoke({"xlsx_path": xlsx_path}))
@@ -248,10 +280,13 @@ def run_narrative_agent(pdf_path: str, xlsx_path: str) -> dict:
     # ── Step 5: Verify each claim via LLM ─────────────────────────────────────
     print("\n── Narrative Agent: Verifying claims against extracted numbers (LLM)...")
     model_name = "gemini-2.5-flash"
-    verdicts = [
-        _llm_compare(claim, _prefilter_sheets(claim, sheets), llm, model_name)
-        for claim in claims
-    ]
+    BATCH_SIZE = 8
+    verdicts = []
+    for i in range(0, len(claims), BATCH_SIZE):
+        batch = claims[i:i + BATCH_SIZE]
+        verdicts.extend(_llm_compare_batch(batch, sheets, llm, model_name))
+    n_batches = (len(claims) + BATCH_SIZE - 1) // BATCH_SIZE
+    print(f"  ✅ Verified {len(claims)} claims in {n_batches} batched LLM call(s).")
 
     # ── Summary ───────────────────────────────────────────────────────────────
     summary = {

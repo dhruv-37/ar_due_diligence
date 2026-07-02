@@ -202,64 +202,92 @@ Narrative: {narrative}
 
 def node_write_memo(state: PipelineState) -> dict:
     print("\n══ Node: WRITE MEMO ════════════════════════════════════════")
-    gemini_key = os.environ.get("GEMINI_API_KEY")
-
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",  # gemini-2.0-flash retired ~June 2026 — was hardcoded to a dead model
-        google_api_key=gemini_key,
-        temperature=0.2,
-    )
-
-    # Summarise data to keep prompt concise
-    extraction_summary = {
-        "status":      state.get("extraction", {}).get("status"),
-        "total_pages": state.get("extraction", {}).get("total_pages"),
-        "output_xlsx": state.get("extraction", {}).get("output_xlsx"),
-    }
-
-    red_flags_summary = {
-        "flags": state.get("red_flags", {}).get("red_flags", []),
-        "error": state.get("red_flags", {}).get("error"),
-    }
-
-    # ── Peer context (so the LLM can judge whether peer-relative flags are
-    #    distorted by business-mix differences, e.g. a diversified
-    #    conglomerate benchmarked against single-segment peers) ──────────────
-    ratios_used = state.get("red_flags", {}).get("ratios_used", {})
-    peer_context = {
-        "segment":             ratios_used.get("computed", {}).get("segment"),
-        "peer_tickers":        ratios_used.get("peer_benchmark_meta", {}).get("peer_tickers", []),
-        "peer_benchmark_status": ratios_used.get("peer_benchmark_meta", {}).get("status"),
-    }
-
-    narrative_summary = {
-        "summary":  state.get("narrative", {}).get("summary"),
-        "verdicts": state.get("narrative", {}).get("verdicts", [])[:20],  # cap at 20
-        "error":    state.get("narrative", {}).get("error"),
-    }
-
-    prompt = _MEMO_PROMPT.format(
-        ticker       = state["ticker"],
-        extraction   = json.dumps(extraction_summary, indent=2),
-        red_flags    = json.dumps(red_flags_summary,  indent=2),
-        narrative    = json.dumps(narrative_summary,  indent=2),
-        peer_context = json.dumps(peer_context,        indent=2),
-    )
-
-    from tools.llm_cache import cached_invoke
-    response  = cached_invoke(llm, prompt, "gemini-2.5-flash")
-    memo_text = response.content
-
-    # ── Write memo to output/ ─────────────────────────────────────────────────
     pdf_stem  = Path(state["pdf_path"]).stem
     memo_path = str(_OUTPUT_DIR / f"{pdf_stem}_memo.md")
     _OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    with open(memo_path, "w", encoding="utf-8") as f:
-        f.write(memo_text)
+    try:
+        gemini_key = os.environ.get("GEMINI_API_KEY")
 
-    print(f"  ✅ Memo written → {memo_path}")
-    return {"memo_text": memo_text, "memo_path": memo_path}
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-2.5-flash",  # gemini-2.0-flash retired ~June 2026 — was hardcoded to a dead model
+            google_api_key=gemini_key,
+            temperature=0.2,
+            max_retries=1,  # was defaulting to 2 — each 429 near quota ceiling was costing 3x billed attempts
+        )
+
+        # Summarise data to keep prompt concise
+        extraction_summary = {
+            "status":      state.get("extraction", {}).get("status"),
+            "total_pages": state.get("extraction", {}).get("total_pages"),
+            "output_xlsx": state.get("extraction", {}).get("output_xlsx"),
+        }
+
+        red_flags_summary = {
+            "flags": state.get("red_flags", {}).get("red_flags", []),
+            "error": state.get("red_flags", {}).get("error"),
+        }
+
+        # ── Peer context (so the LLM can judge whether peer-relative flags are
+        #    distorted by business-mix differences, e.g. a diversified
+        #    conglomerate benchmarked against single-segment peers) ──────────────
+        ratios_used = state.get("red_flags", {}).get("ratios_used", {})
+        peer_context = {
+            "segment":             ratios_used.get("computed", {}).get("segment"),
+            "peer_tickers":        ratios_used.get("peer_benchmark_meta", {}).get("peer_tickers", []),
+            "peer_benchmark_status": ratios_used.get("peer_benchmark_meta", {}).get("status"),
+        }
+
+        narrative_summary = {
+            "summary":  state.get("narrative", {}).get("summary"),
+            "verdicts": state.get("narrative", {}).get("verdicts", [])[:20],  # cap at 20
+            "error":    state.get("narrative", {}).get("error"),
+        }
+
+        prompt = _MEMO_PROMPT.format(
+            ticker       = state["ticker"],
+            extraction   = json.dumps(extraction_summary, indent=2),
+            red_flags    = json.dumps(red_flags_summary,  indent=2),
+            narrative    = json.dumps(narrative_summary,  indent=2),
+            peer_context = json.dumps(peer_context,        indent=2),
+        )
+
+        from tools.llm_cache import cached_invoke
+        response  = cached_invoke(llm, prompt, "gemini-2.5-flash")
+        memo_text = response.content
+
+        with open(memo_path, "w", encoding="utf-8") as f:
+            f.write(memo_text)
+
+        print(f"  ✅ Memo written → {memo_path}")
+        return {"memo_text": memo_text, "memo_path": memo_path}
+
+    except Exception as exc:
+        # Last node in the graph — if this call is the one that hits the quota
+        # wall, we still want the run's extraction/red-flags/narrative output
+        # on disk instead of losing everything. Write a fallback memo with the
+        # raw data dumped in, and surface the error.
+        print(f"  ⚠️  Memo LLM call failed: {exc}")
+        fallback_text = (
+            f"# Due Diligence Memo — {state.get('ticker', 'UNKNOWN')}\n\n"
+            f"⚠️ **Memo generation failed**: `{exc}`\n\n"
+            "The LLM call for the final memo did not complete, but the earlier "
+            "pipeline stages did — raw results are included below.\n\n"
+            "## Extraction\n```json\n" + json.dumps(state.get("extraction", {}), indent=2) + "\n```\n\n"
+            "## Red Flags\n```json\n" + json.dumps(state.get("red_flags", {}), indent=2) + "\n```\n\n"
+            "## Narrative\n```json\n" + json.dumps(state.get("narrative", {}), indent=2) + "\n```\n"
+        )
+        try:
+            with open(memo_path, "w", encoding="utf-8") as f:
+                f.write(fallback_text)
+        except Exception:
+            pass
+
+        return {
+            "memo_text": fallback_text,
+            "memo_path": memo_path,
+            "errors": [f"Memo writer error: {exc}"],
+        }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
