@@ -58,15 +58,25 @@ if _THIS_DIR not in _sys.path:
 _PROJECT_ROOT = str(_pathlib.Path(__file__).resolve().parent.parent)
 try:
     from pipeline.taxonomy import TAXONOMY, get_taxonomy_enums
+    from pipeline.taxonomy_mapper import map_line_items, build_populated_dictionary
     TAXONOMY_AVAILABLE = True
     print("✅  taxonomy.py loaded successfully.")
 except ImportError:
     TAXONOMY_AVAILABLE = False
-    print("⚠️  taxonomy.py not found — schema-driven extraction needs it to build the taxonomy_node enum.")
+    print("⚠️  taxonomy.py not found — fuzzy taxonomy mapping disabled.")
 
     def get_taxonomy_enums() -> list:
-        # Minimal fallback so call_gemini can still build a schema.
         return ["UNMAPPED"]
+
+    def map_line_items(records: list) -> list:
+        for rec in records:
+            rec["taxonomy_node"] = str(rec.get("raw_string", "")).strip()
+            rec["fs_statement"] = ""
+            rec["match_score"] = 0.0
+        return records
+
+    def build_populated_dictionary(df) -> dict:
+        return {}
 
 
 GEMINI_KEY   = os.environ.get("GEMINI_API_KEY")
@@ -618,11 +628,13 @@ _GEMINI_MODEL: str = "gemini-2.5-flash"
 _EXTRACTION_PROMPT_TEMPLATE = """Below is text from a financial statement PDF of an Indian company.
 Extract EVERY SINGLE LINE ITEM from ALL financial statements including Statement of Changes in Equity.
 You must extract BOTH Standalone and Consolidated statements and clearly segregate them by "scope".
+Extract EVERY line item exactly as it appears — do NOT skip or omit any row, even ones you don't
+recognize (e.g. "Intangible Assets Under Development", "Financial Assets", sub-notes, etc).
 
 For EACH line item, output:
 - raw_string    : the exact text of the line item as it appears in the PDF.
-- taxonomy_node : the Internal Taxonomy Node this line item belongs to, chosen from the
-                  allowed enum list. If nothing fits, use "UNMAPPED" — do NOT guess.
+- statement     : which financial statement this row belongs to — one of
+                  "Profit and Loss", "Balance Sheet", "Cash Flow", "Statement of Changes in Equity".
 - scope         : "STANDALONE" or "CONSOLIDATED".
 - current_year  : the current year (2024-25) figure, or null.
 - previous_year : the previous year (2023-24) figure, or null.
@@ -655,22 +667,23 @@ def _build_extraction_response_schema():
     """
     from google.genai import types
 
-    enums = get_taxonomy_enums()
-
     return types.Schema(
         type=types.Type.ARRAY,
         items=types.Schema(
             type=types.Type.OBJECT,
             properties={
                 "raw_string": types.Schema(type=types.Type.STRING),
-                "taxonomy_node": types.Schema(type=types.Type.STRING, enum=enums),
+                "statement": types.Schema(
+                    type=types.Type.STRING,
+                    enum=["Profit and Loss", "Balance Sheet", "Cash Flow", "Statement of Changes in Equity"],
+                ),
                 "scope": types.Schema(
                     type=types.Type.STRING, enum=["STANDALONE", "CONSOLIDATED"]
                 ),
                 "current_year": types.Schema(type=types.Type.NUMBER, nullable=True),
                 "previous_year": types.Schema(type=types.Type.NUMBER, nullable=True),
             },
-            required=["raw_string", "taxonomy_node", "scope"],
+            required=["raw_string", "statement", "scope"],
         ),
     )
 
@@ -1207,33 +1220,38 @@ def extract_financials(pdf_path: str, output_xlsx: str = "financials.xlsx"):
         with open(cache_file, "w") as f:
             json.dump(all_data, f, indent=2)
 
+    # ── Taxonomy mapping (fuzzy match, NO LLM) ────────────────────────────────
+    # The LLM extracts raw_string/statement/scope/current_year/previous_year —
+    # "statement" here is structural placement (which FS sheet), extracted by
+    # the LLM so no row is ever dropped for lacking a dictionary match.
+    # taxonomy_node is a separate, purely additive label assigned afterwards
+    # in Python by fuzzy-matching raw_string against fs_dictionary.py.
+    all_data = map_line_items(all_data)
+
     df = pd.DataFrame(all_data)
 
-    # ── Schema-driven taxonomy mapping ────────────────────────────────────────
-    # taxonomy_node and scope now come straight from the LLM's schema-constrained
-    # JSON output (call_gemini) rather than a later Python-side fuzzy match.
-    # statement / section / is_total are derived from the node's registry
-    # metadata — that's what "shifting the taxonomy mapping to the initial
-    # extraction step" buys us: the LLM only has to pick the node, everything
-    # else about where it lives in the workbook follows deterministically.
     df["taxonomy_node"] = df.get("taxonomy_node", "UNMAPPED").fillna("UNMAPPED")
-    df.loc[~df["taxonomy_node"].isin(TAXONOMY.keys()), "taxonomy_node"] = "UNMAPPED"
 
     df["scope"]       = df.get("scope", "STANDALONE").fillna("STANDALONE")
     df["report_type"] = df["scope"].map(
         lambda s: "Consolidated" if str(s).upper() == "CONSOLIDATED" else "Standalone"
     )
 
-    df["line_item"]  = df["raw_string"].fillna("")
-    df["statement"]  = df["taxonomy_node"].map(lambda n: TAXONOMY[n].statement.value)
-    df["section"]    = df["taxonomy_node"].map(lambda n: TAXONOMY[n].section)
-    df["is_total"]   = df["taxonomy_node"].map(lambda n: TAXONOMY[n].is_total)
+    df["line_item"]     = df["raw_string"].fillna("")
+    df["statement"]      = df.get("statement", "").fillna("")
+    df.loc[~df["statement"].isin(
+        ["Profit and Loss", "Balance Sheet", "Cash Flow", "Statement of Changes in Equity"]
+    ), "statement"] = "Unmapped Items"
+    df["section"]        = df["statement"]
+    df["is_total"]       = df["line_item"].str.lower().str.contains(
+        r"\btotal\b|\bnet\b|profit|closing|opening", regex=True, na=False
+    )
 
-    unmapped = df[df["taxonomy_node"] == "UNMAPPED"]["line_item"].unique()
-    if len(unmapped):
-        print(f"\n⚠️  {len(unmapped)} UNMAPPED line item(s) written through to Excel "
-              f"under 'Unmapped Items' — the LLM could not confidently classify these:")
-        for u in unmapped:
+    unmatched = df[df["fs_statement"] == ""]["line_item"].unique()
+    if len(unmatched):
+        print(f"\n⚠️  {len(unmatched)} line item(s) had no confident dictionary match "
+              f"and were named after their own raw text instead (still placed on their correct sheet):")
+        for u in unmatched:
             print(f"    {u}")
 
     df = df.drop_duplicates(subset=["report_type", "statement", "line_item"])
@@ -1247,6 +1265,17 @@ def extract_financials(pdf_path: str, output_xlsx: str = "financials.xlsx"):
         print(f"  {seg.report_type}  |  statements: {list(seg.statements.keys())}  |  has_associates={seg.has_associates}")
 
     build_excel(df, output_xlsx)
+
+    # ── Structured JSON output (taxonomy-mapped, for downstream reuse) ───────
+    output_json = os.path.splitext(output_xlsx)[0] + "_taxonomy.json"
+    json_records = df[["line_item", "taxonomy_node", "fs_statement", "statement",
+                        "is_total", "report_type", "current_year", "previous_year",
+                        "match_score"]].to_dict(orient="records")
+    populated_dict = build_populated_dictionary(df)
+    with open(output_json, "w") as f:
+        json.dump({"line_items": json_records, "fs_dictionary": populated_dict}, f, indent=2, default=str)
+    print(f"📄  Structured taxonomy JSON written → {output_json}")
+
     return df
 
 if __name__ == "__main__":
