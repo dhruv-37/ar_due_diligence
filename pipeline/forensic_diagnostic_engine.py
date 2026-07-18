@@ -1051,6 +1051,7 @@ def run_full_pipeline(
     normalized_consolidated_path = os.path.join(out_dir, f"{ticker}_normalized_consolidated.json")
     diagnostic_json_path = os.path.join(out_dir, f"{ticker}_diagnostics.json")
     diagnostic_md_path = os.path.join(out_dir, f"{ticker}_diagnostics.md")
+    diagnostic_input_path = os.path.join(out_dir, f"{ticker}_diagnostic_input.json")
 
     logger.info("Step 1: extracting core financial pages -> %s", trimmed_pdf)
     extract_core_financial_statements(pdf_path, trimmed_pdf, gemini_key)
@@ -1077,6 +1078,14 @@ def run_full_pipeline(
     diagnostic_input = build_diagnostic_input_from_pipeline(
         taxonomy_json, normalized_standalone, normalized_consolidated
     )
+    # Persist the EXACT {line_items, fs_dictionary} object the engine
+    # consumes — this is what audit_layer_inputs.py needs. Previously this
+    # was only ever built in-memory, so there was no file that reflected
+    # what Layer A/B/C actually saw as input; only the diagnostics OUTPUT
+    # (which metrics fired) was saved, not the diagnostics INPUT (which
+    # metrics were even available to fire).
+    with open(diagnostic_input_path, "w", encoding="utf-8") as f:
+        json.dump(diagnostic_input, f, indent=2, default=str)
     engine = ForensicDiagnosticEngine(diagnostic_input)
     report = engine.run_full_diagnostics()
 
@@ -1088,7 +1097,8 @@ def run_full_pipeline(
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-    print(f"\n📄  Diagnostics JSON  -> {diagnostic_json_path}")
+    print(f"\n📄  Diagnostic input   -> {diagnostic_input_path}   (feed this to audit_layer_inputs.py)")
+    print(f"📄  Diagnostics JSON  -> {diagnostic_json_path}")
     print(f"📄  Diagnostics MD    -> {diagnostic_md_path}")
     print("\n" + ForensicDiagnosticEngine.to_markdown(report))
 

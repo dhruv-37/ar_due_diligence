@@ -39,10 +39,19 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.exceptions import IllegalCharacterError
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 import re
 import sys
 from dataclasses import dataclass, field
 from typing import Optional
+
+
+def _sanitize_excel_value(val):
+    """Strip characters that openpyxl/Excel XML cannot store (control chars etc.)."""
+    if isinstance(val, str):
+        return ILLEGAL_CHARACTERS_RE.sub("", val)
+    return val
 
 # ── Taxonomy import (graceful fallback if file not present) ──────────────────
 # Insert the directory that contains THIS script so `taxonomy.py` is always
@@ -237,6 +246,24 @@ def get_row_by_node(cell_map: dict, node_name: str) -> Optional[int]:
 TOLERANCE_LAKHS = 1.0   # ±1 unit rounding tolerance (in whatever reporting unit the source uses)
 
 
+def _is_missing(ws, row: Optional[int], col: str) -> bool:
+    """
+    True if the target cell has no usable value at all — i.e. the LLM
+    extraction left it blank (None) or an empty string — as opposed to
+    holding a real (possibly wrong) hardcoded number.
+
+    This distinction matters for `_try_inject`: a missing cell should be
+    backfilled unconditionally from the first fully-resolvable algebra
+    equation, whereas a cell that already holds a number should only be
+    overwritten with a formula if that formula's computed value actually
+    matches it (verification mode).
+    """
+    if row is None:
+        return True
+    v = ws[f"{col}{row}"].value
+    return v is None or (isinstance(v, str) and not v.strip())
+
+
 def _val(ws, row: Optional[int], col: str) -> float:
     """
     Read a numeric cell value; return 0.0 if missing or non-numeric.
@@ -261,14 +288,28 @@ def _try_inject(ws, target_row: int, col: str,
     Multi-pass trial loop (Task 1 core).
 
     `equations` is an ordered list of (computed_value, excel_formula) tuples.
-    The first equation whose computed_value matches the hardcoded cell value
-    within TOLERANCE_LAKHS is injected into the cell and returns True.
+
+    Two modes:
+      - BACKFILL: if the target cell is genuinely missing (the LLM
+        extraction never wrote a value there — see `_is_missing`), inject
+        the first fully-resolvable equation unconditionally. There is
+        nothing to "verify" against, so recovering the value via the
+        known accounting identity is strictly better than leaving it blank
+        (this is what recovers e.g. a missing Total Assets or Closing Cash
+        figure when the source extraction dropped that one cell).
+      - VERIFY: if the target cell already holds a hardcoded number,
+        only convert it to a live formula when the computed value matches
+        it within TOLERANCE_LAKHS — this preserves the original
+        cross-check behaviour and never silently overwrites a number that
+        disagrees with the algebra (that disagreement is exactly what the
+        forensic layer wants to see).
     """
     if target_row is None:
         return False
+    missing = _is_missing(ws, target_row, col)
     target_val = _val(ws, target_row, col)
     for computed, formula in equations:
-        if abs(computed - target_val) <= TOLERANCE_LAKHS:
+        if missing or abs(computed - target_val) <= TOLERANCE_LAKHS:
             ws[f"{col}{target_row}"] = formula
             return True
     return False
@@ -399,7 +440,7 @@ def inject_bs_algebra(ws, cell_map: dict, col: str):
     v_tca  = _val(ws, tca,  col)
 
     # ── 1. Total Liabilities = Non-Current + Current ────────────────────────
-    if tl and tncl and tcl:
+    if tl and tncl and tcl and not (_is_missing(ws, tncl, col) or _is_missing(ws, tcl, col)):
         _try_inject(ws, tl, col, [
             (v_tncl + v_tcl, f"={col}{tncl}+{col}{tcl}"),
         ])
@@ -409,7 +450,7 @@ def inject_bs_algebra(ws, cell_map: dict, col: str):
     # if that cell was just turned into a formula, _val() would return 0.0
     # for it post-injection, corrupting this equation. The pre-read raw value
     # is the correct operand regardless of whether TL itself got a formula.
-    if teal and te and tl:
+    if teal and te and tl and not (_is_missing(ws, te, col) or _is_missing(ws, tl, col)):
         _try_inject(ws, teal, col, [
             (v_te + v_tl, f"={col}{te}+{col}{tl}"),
         ])
@@ -418,7 +459,7 @@ def inject_bs_algebra(ws, cell_map: dict, col: str):
     # Component-based sum rather than an equity-and-liabilities mirror.
     # v_tnca and v_tca are pre-read raw values — safe even if earlier steps
     # have overwritten other cells with formulas (_val() returns 0.0 for those).
-    if ta and tnca and tca:
+    if ta and tnca and tca and not (_is_missing(ws, tnca, col) or _is_missing(ws, tca, col)):
         _try_inject(ws, ta, col, [
             (v_tnca + v_tca, f"={col}{tnca}+{col}{tca}"),
         ])
@@ -466,7 +507,7 @@ def inject_cf_algebra(ws, cell_map: dict, col: str):
     v_open  = _val(ws, r_open,  col)
 
     # ── 1. Cash Generated from Operations = Op Profit before WC + WC Adj ───
-    if r_cgen and r_opwc and r_wcadj:
+    if r_cgen and r_opwc and r_wcadj and not (_is_missing(ws, r_opwc, col) or _is_missing(ws, r_wcadj, col)):
         _try_inject(ws, r_cgen, col, [
             (v_opwc + v_wcadj, f"={col}{r_opwc}+{col}{r_wcadj}"),
         ])
@@ -475,19 +516,21 @@ def inject_cf_algebra(ws, cell_map: dict, col: str):
     # v_cgen is the pre-injection raw value (same pattern as inject_bs_algebra:
     # if step 1 just turned r_cgen into a formula, _val() would read 0.0 for
     # it post-injection, corrupting this equation).
-    if r_nco and r_cgen and r_tax:
+    if r_nco and r_cgen and r_tax and not (_is_missing(ws, r_cgen, col) or _is_missing(ws, r_tax, col)):
         _try_inject(ws, r_nco, col, [
             (v_cgen + v_tax, f"={col}{r_cgen}+{col}{r_tax}"),
         ])
 
     # ── 3. Net Change in Cash = Operating + Investing + Financing ──────────
-    if r_nchg and r_nco and r_nci and r_ncf:
+    if r_nchg and r_nco and r_nci and r_ncf and not (
+        _is_missing(ws, r_nco, col) or _is_missing(ws, r_nci, col) or _is_missing(ws, r_ncf, col)
+    ):
         _try_inject(ws, r_nchg, col, [
             (v_nco + v_nci + v_ncf, f"={col}{r_nco}+{col}{r_nci}+{col}{r_ncf}"),
         ])
 
     # ── 4. Closing Cash Balance = Opening Balance + Net Change ─────────────
-    if r_close and r_open and r_nchg:
+    if r_close and r_open and r_nchg and not (_is_missing(ws, r_open, col) or _is_missing(ws, r_nchg, col)):
         _try_inject(ws, r_close, col, [
             (v_open + v_nchg, f"={col}{r_open}+{col}{r_nchg}"),
         ])
@@ -635,6 +678,12 @@ _UNIT_PATTERNS = [
     (re.compile(r"(?:₹|`|Rs\.?|INR)\s*(?:in\s+)?Millions?\b", re.IGNORECASE), "₹ Million"),
     (re.compile(r"\bin\s+Millions?\b", re.IGNORECASE), "₹ Million"),
     (re.compile(r"(?:amounts?|figures?)\s+(?:are\s+)?in\s+(?:₹|`|Rs\.?|INR)?\s*Millions?", re.IGNORECASE), "₹ Million"),
+    # Abbreviated "Mn" form — e.g. "` Mn" header on Vodafone Idea's statements,
+    # where the backtick is the ₹ OCR-surrogate. Without this pattern, ARs
+    # that only use the "Mn" abbreviation (never spell out "Million") matched
+    # nothing and silently fell back to the wrong "₹ Lakh" default below.
+    (re.compile(r"(?:₹|`|Rs\.?|INR)\s*Mn\.?\b", re.IGNORECASE), "₹ Million"),
+    (re.compile(r"\bin\s+Mn\.?\b", re.IGNORECASE), "₹ Million"),
 
     (re.compile(r"(?:₹|`|Rs\.?|INR)\s*(?:in\s+)?Billions?\b", re.IGNORECASE), "₹ Billion"),
     (re.compile(r"\bin\s+Billions?\b", re.IGNORECASE), "₹ Billion"),
@@ -990,7 +1039,7 @@ def build_excel(df, output_path: str, unit_label: str = "₹ Lakh"):
                     ws.row_dimensions[row].height = 21
                     ws.merge_cells(f"A{row}:D{row}")
                     cell           = ws[f"A{row}"]
-                    cell.value     = section
+                    cell.value     = _sanitize_excel_value(section)
                     cell.font      = SECTION_FONT
                     cell.fill      = SECTION_FILL
                     cell.alignment = LEFT
@@ -1017,7 +1066,7 @@ def build_excel(df, output_path: str, unit_label: str = "₹ Lakh"):
 
             # Column A — text
             ca            = ws[f"A{row}"]
-            ca.value      = item
+            ca.value      = _sanitize_excel_value(item)
             ca.font       = a_font
             ca.fill       = fill
             ca.alignment  = a_align
@@ -1025,7 +1074,7 @@ def build_excel(df, output_path: str, unit_label: str = "₹ Lakh"):
             # Columns B & C — numeric
             for col_letter, val in [("B", cy_val), ("C", py_val)]:
                 nc               = ws[f"{col_letter}{row}"]
-                nc.value         = val
+                nc.value         = _sanitize_excel_value(val)
                 nc.font          = num_font
                 nc.fill          = fill
                 nc.alignment     = RIGHT
@@ -1033,7 +1082,7 @@ def build_excel(df, output_path: str, unit_label: str = "₹ Lakh"):
 
             # Column D — taxonomy node (metadata only, not read by the algebra engine)
             dc            = ws[f"D{row}"]
-            dc.value      = rec.get("taxonomy_node", "UNMAPPED")
+            dc.value      = _sanitize_excel_value(rec.get("taxonomy_node", "UNMAPPED"))
             dc.font       = a_font
             dc.fill       = fill
             dc.alignment  = CENTER

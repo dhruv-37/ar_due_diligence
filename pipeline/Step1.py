@@ -49,6 +49,60 @@ from typing import Any
 
 import fitz  # PyMuPDF
 
+
+def _fill_page_gaps(pages: list[int]) -> list[int]:
+    """
+    Given a sorted set of page numbers, fill in the pages inside every
+    consecutive gap EXCEPT the single largest gap, which is left alone
+    (that gap is assumed to be a genuine section boundary — e.g. between
+    the Auditor's Report signature block and the financial statements —
+    rather than a page Phase 2 simply missed).
+
+    Example
+    -------
+    Input  (sorted): 24, 25, 28, 29, 30, 60, 61, 62, 64
+    Gaps:            1,  3,  1,  1, 30,  1,  1,  2
+    Largest gap is 30 - 29 = 30 (between page 30 and page 60) → left as-is.
+    All other gaps get filled:
+        25 → 28  (gap 3) → fill 26, 27
+        62 → 64  (gap 2) → fill 63
+    Output: 24, 25, 26, 27, 28, 29, 30, 60, 61, 62, 63, 64
+
+    If there are multiple gaps tied for the largest size, all of them are
+    left unfilled (only gaps strictly smaller than the max get filled).
+
+    Parameters
+    ----------
+    pages : list[int]
+        Candidate page numbers (any indexing convention — 0-indexed or
+        1-indexed, doesn't matter, this function is agnostic to it).
+
+    Returns
+    -------
+    list[int]
+        Sorted, de-duplicated page numbers with small gaps filled in.
+    """
+    unique_sorted = sorted(set(pages))
+    if len(unique_sorted) < 2:
+        return unique_sorted
+
+    gaps = [unique_sorted[i + 1] - unique_sorted[i] for i in range(len(unique_sorted) - 1)]
+    max_gap = max(gaps)
+
+    filled: list[int] = [unique_sorted[0]]
+    for i in range(1, len(unique_sorted)):
+        prev_page = unique_sorted[i - 1]
+        curr_page = unique_sorted[i]
+        gap = gaps[i - 1]
+
+        if gap > 1 and gap != max_gap:
+            # Small/medium gap — fill in every page in between.
+            filled.extend(range(prev_page + 1, curr_page))
+
+        filled.append(curr_page)
+
+    return sorted(set(filled))
+
 # ── Import Phase 1 & Phase 2 public APIs ─────────────────────────────────────
 # These modules must be importable from the same package / working directory.
 # Adjust the import paths to match your project layout if needed.
@@ -274,6 +328,21 @@ def generate_output_pdf(
     all_pages: set[int] = set()
     for key in expected_keys:
         all_pages.update(page_mapping.get(key, []))
+
+    # ── Fill small gaps between candidate pages ───────────────────────────────
+    # Phase 2's per-category classification can leave small holes in an
+    # otherwise-contiguous run of financial-statement pages (e.g. a page that
+    # is 90% table but got classified as "narrative" and dropped). We treat
+    # the single largest gap in the sorted candidate list as a genuine section
+    # boundary (e.g. Auditor's Report → Financial Statements) and leave it
+    # alone, but fill in every smaller gap so we don't lose pages in the
+    # middle of a statement (this is what was silently truncating the
+    # Income Statement / P&L pages out of some trimmed PDFs).
+    pre_fill_pages = sorted(all_pages)
+    all_pages = set(_fill_page_gaps(pre_fill_pages))
+    filled_in = sorted(all_pages - set(pre_fill_pages))
+    if filled_in:
+        log.info("  Gap-fill added %d page(s) inside small gaps: %s", len(filled_in), filled_in)
 
     log.info("Phase 3 ─ Assembly & Output Generation")
     log.info("  Source PDF      : %s", source_path)

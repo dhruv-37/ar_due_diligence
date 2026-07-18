@@ -86,9 +86,23 @@ _BS_ITEMS = {
 }
 
 _CF_ITEMS = {
+    # Pre-tax-refund operating cash flow subtotal — Indian Schedule III cash
+    # flow statements usually show this as a distinct line ("Cash flows
+    # from operating activities" / "Cash generated from operations") BEFORE
+    # the "Income tax refund/(paid)" adjustment, with a separate "Net cash
+    # flows from operating activities" line after it. Without its own node,
+    # this subtotal fuzzy-matched best to "Net Cash From Operating
+    # Activities" too, lost the uniqueness tie-break to the real net-cash
+    # line, and fell through to its next-best (wrong) candidate — which was
+    # "Net Cash From Investing Activities" purely by keyword-overlap
+    # coincidence. Giving it its own node stops that misroute entirely.
+    "Cash Generated From Operations": ["cash flows from operating activities",
+                                        "cash generated from operations",
+                                        "cash generated from/ (used in) operations",
+                                        "cash flow from operations before working capital changes"],
     "Net Cash From Operating Activities": ["net cash from operating activities",
                                             "net cash generated from operating activities",
-                                            "cash flow from operating activities"],
+                                            "net cash flows from operating activities"],
     "Net Cash From Investing Activities": ["net cash from investing activities",
                                             "net cash used in investing activities"],
     "Net Cash From Financing Activities": ["net cash from financing activities",
