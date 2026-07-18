@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from agents.memo_agent import run_due_diligence
+from pipeline.taxonomy import TAXONOMY, Sign, Statement
 
 UPLOAD_DIR = Path(_ROOT) / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -39,6 +40,34 @@ _IMPORTANT_NODES = {
     "CASH_AND_CASH_EQUIVALENTS", "GROSS_FIXED_ASSETS", "NET_FIXED_ASSETS",
     "NET_WORTH", "GROSS_DEBT", "RESERVE_CLOSING_BALANCE",
 }
+
+# ── Row category → background colour (muted, single blue-grey family) ──────
+_CATEGORY_COLORS = {
+    "heading":    "#dce1f0",   # section banners / subheadings — distinct, cool grey-blue
+    "total":      "#c9d6ee",   # subtotals / grand totals — slightly deeper
+    "income":     "#e4ecf7",   # P&L inflow items
+    "expense":    "#eef1f8",   # P&L outflow items
+    "asset":      "#e7edf6",   # balance sheet assets
+    "liability":  "#eef0f7",   # balance sheet liabilities / equity
+    "cashflow":   "#e9edf6",   # cash flow statement items
+    "unmapped":   "#f5f6fa",   # UNMAPPED / unlinked line items
+}
+
+def _row_category(node_val: str, is_heading: bool) -> str:
+    if is_heading:
+        return "heading"
+    node = TAXONOMY.get(node_val) if node_val else None
+    if node is None:
+        return "unmapped"
+    if node.is_total:
+        return "total"
+    if node.statement == Statement.CASH_FLOW:
+        return "cashflow"
+    if node.statement == Statement.BALANCE_SHEET:
+        return "liability" if node.sign == Sign.NEGATIVE else "asset"
+    # Profit and Loss / Changes in Equity
+    return "expense" if node.sign == Sign.NEGATIVE else "income"
+
 
 # ── Background job tracking ─────────────────────────────────────────────────
 _JOBS = {}
@@ -387,15 +416,16 @@ def result(job_id):
     return redirect(url_for("index"))
 
 
-def _cell_html(value, bold=False):
+def _cell_html(value, bold=False, bg=None):
     cls = "num" if isinstance(value, (int, float)) else ""
     cls = (cls + " important").strip() if bold else cls
     cls_attr = f' class="{cls}"' if cls else ""
+    style_attr = f' style="background:{bg};"' if bg else ""
     if isinstance(value, float):
-        return f'<td{cls_attr}>{value:,.2f}</td>'
+        return f'<td{cls_attr}{style_attr}>{value:,.2f}</td>'
     if isinstance(value, int):
-        return f'<td{cls_attr}>{value:,}</td>'
-    return f"<td{cls_attr}>{'' if value is None else value}</td>"
+        return f'<td{cls_attr}{style_attr}>{value:,}</td>'
+    return f"<td{cls_attr}{style_attr}>{'' if value is None else value}</td>"
 
 
 @app.route("/excel")
@@ -428,7 +458,14 @@ def view_excel():
             node_val = str(row[taxonomy_col]).strip().upper() if taxonomy_col is not None and taxonomy_col < len(row) else ""
             is_important = node_val in _IMPORTANT_NODES
             display_row = [v for idx, v in enumerate(row) if idx != taxonomy_col]
-            cells = "".join(_cell_html(v, bold=is_important) for v in display_row)
+            # Heading / subheading rows: no numeric values in the FY columns
+            numeric_vals = [v for idx, v in enumerate(row)
+                             if idx != taxonomy_col and idx != 0
+                             and isinstance(v, (int, float))]
+            is_heading = len(numeric_vals) == 0
+            category = _row_category(node_val, is_heading)
+            row_color = _CATEGORY_COLORS[category]
+            cells = "".join(_cell_html(v, bold=is_important, bg=None if is_important else row_color) for v in display_row)
             row_cls = ' class="important-row"' if is_important else ""
             rows_html.append(f"<tr{row_cls}>{cells}</tr>")
 

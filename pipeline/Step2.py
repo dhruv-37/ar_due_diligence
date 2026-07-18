@@ -621,13 +621,23 @@ def clean_number(val):
 # millions unless otherwise stated"). Different companies/years use different
 # units, so we detect it from the actual PDF text instead of assuming one.
 _UNIT_PATTERNS = [
-    (re.compile(r"₹?\s*(?:in|In)\s*Crore", re.IGNORECASE), "₹ Crore"),
-    (re.compile(r"Rs\.?\s*(?:in|In)\s*Crore", re.IGNORECASE), "₹ Crore"),
-    (re.compile(r"₹?\s*(?:in|In)\s*Lakh", re.IGNORECASE), "₹ Lakh"),
-    (re.compile(r"Rs\.?\s*(?:in|In)\s*Lakh", re.IGNORECASE), "₹ Lakh"),
-    (re.compile(r"₹?\s*(?:in|In)\s*Million", re.IGNORECASE), "₹ Million"),
-    (re.compile(r"Rs\.?\s*(?:in|In)\s*Million", re.IGNORECASE), "₹ Million"),
-    (re.compile(r"₹?\s*(?:in|In)\s*Billion", re.IGNORECASE), "₹ Billion"),
+    # ₹ / Rs. / backtick (common OCR/PDF-extraction surrogate for ₹) + "in Crore(s)" / "Cr."
+    (re.compile(r"(?:₹|`|Rs\.?|INR)\s*(?:in\s+)?Crores?\b", re.IGNORECASE), "₹ Crore"),
+    (re.compile(r"\bin\s+Crores?\b", re.IGNORECASE), "₹ Crore"),
+    (re.compile(r"(?:₹|`|Rs\.?|INR)\s*Cr\.?\b", re.IGNORECASE), "₹ Crore"),
+    # "(All amounts/figures are/in ... Crore, unless otherwise stated)" style headers
+    (re.compile(r"(?:amounts?|figures?)\s+(?:are\s+)?in\s+(?:₹|`|Rs\.?|INR)?\s*Crores?", re.IGNORECASE), "₹ Crore"),
+
+    (re.compile(r"(?:₹|`|Rs\.?|INR)\s*(?:in\s+)?Lakhs?\b", re.IGNORECASE), "₹ Lakh"),
+    (re.compile(r"\bin\s+Lakhs?\b", re.IGNORECASE), "₹ Lakh"),
+    (re.compile(r"(?:amounts?|figures?)\s+(?:are\s+)?in\s+(?:₹|`|Rs\.?|INR)?\s*Lakhs?", re.IGNORECASE), "₹ Lakh"),
+
+    (re.compile(r"(?:₹|`|Rs\.?|INR)\s*(?:in\s+)?Millions?\b", re.IGNORECASE), "₹ Million"),
+    (re.compile(r"\bin\s+Millions?\b", re.IGNORECASE), "₹ Million"),
+    (re.compile(r"(?:amounts?|figures?)\s+(?:are\s+)?in\s+(?:₹|`|Rs\.?|INR)?\s*Millions?", re.IGNORECASE), "₹ Million"),
+
+    (re.compile(r"(?:₹|`|Rs\.?|INR)\s*(?:in\s+)?Billions?\b", re.IGNORECASE), "₹ Billion"),
+    (re.compile(r"\bin\s+Billions?\b", re.IGNORECASE), "₹ Billion"),
 ]
 
 
@@ -1048,6 +1058,7 @@ def build_excel(df, output_path: str, unit_label: str = "₹ Lakh"):
             ws.column_dimensions[col_letter].width = max(14, max_len + 4)
 
         ws.column_dimensions["D"].width = 32
+        ws.column_dimensions["D"].hidden = True
         ws.freeze_panes = "A3"
 
     # ── Build workbook ────────────────────────────────────────────────────────
@@ -1315,7 +1326,8 @@ def extract_financials(pdf_path: str, output_xlsx: str = "financials.xlsx"):
                         "match_score"]].to_dict(orient="records")
     populated_dict = build_populated_dictionary(df)
     with open(output_json, "w") as f:
-        json.dump({"line_items": json_records, "fs_dictionary": populated_dict}, f, indent=2, default=str)
+        json.dump({"line_items": json_records, "fs_dictionary": populated_dict,
+                    "reporting_unit": unit_label}, f, indent=2, default=str)
     print(f"📄  Structured taxonomy JSON written → {output_json}")
 
     return df
