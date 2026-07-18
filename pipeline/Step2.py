@@ -234,7 +234,7 @@ def get_row_by_node(cell_map: dict, node_name: str) -> Optional[int]:
 # MULTI-PASS ALGEBRAIC SOLVER  (Task 1)
 # ─────────────────────────────────────────────────────────────────────────────
 
-TOLERANCE_LAKHS = 1.0   # ±1 Lakh rounding tolerance
+TOLERANCE_LAKHS = 1.0   # ±1 unit rounding tolerance (in whatever reporting unit the source uses)
 
 
 def _val(ws, row: Optional[int], col: str) -> float:
@@ -613,6 +613,44 @@ def clean_number(val):
     return val
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# UNIT DETECTION
+# ─────────────────────────────────────────────────────────────────────────────
+# Indian financial statements state their reporting unit explicitly near the
+# top of each statement (e.g. "(₹ in Crore)", "Rs. in Lakh", "all amounts in
+# millions unless otherwise stated"). Different companies/years use different
+# units, so we detect it from the actual PDF text instead of assuming one.
+_UNIT_PATTERNS = [
+    (re.compile(r"₹?\s*(?:in|In)\s*Crore", re.IGNORECASE), "₹ Crore"),
+    (re.compile(r"Rs\.?\s*(?:in|In)\s*Crore", re.IGNORECASE), "₹ Crore"),
+    (re.compile(r"₹?\s*(?:in|In)\s*Lakh", re.IGNORECASE), "₹ Lakh"),
+    (re.compile(r"Rs\.?\s*(?:in|In)\s*Lakh", re.IGNORECASE), "₹ Lakh"),
+    (re.compile(r"₹?\s*(?:in|In)\s*Million", re.IGNORECASE), "₹ Million"),
+    (re.compile(r"Rs\.?\s*(?:in|In)\s*Million", re.IGNORECASE), "₹ Million"),
+    (re.compile(r"₹?\s*(?:in|In)\s*Billion", re.IGNORECASE), "₹ Billion"),
+]
+
+
+def detect_reporting_unit(text: str) -> str:
+    """Detects the reporting unit (Crore / Lakh / Million / Billion) as
+    actually stated in the source PDF text, by counting occurrences of each
+    pattern and taking the most frequent — rather than assuming a fixed unit.
+    Falls back to '₹ Lakh' (labelled as a fallback) only if nothing is found,
+    which is a strong signal the extraction should be checked manually."""
+    counts: dict[str, int] = {}
+    for pattern, label in _UNIT_PATTERNS:
+        n = len(pattern.findall(text))
+        if n:
+            counts[label] = counts.get(label, 0) + n
+    if not counts:
+        print("  ⚠️  Could not detect a reporting unit (Crore/Lakh/Million) in the PDF text — "
+              "defaulting to '₹ Lakh' as a fallback. Please verify against the source.")
+        return "₹ Lakh"
+    detected = max(counts, key=counts.get)
+    print(f"  📏  Detected reporting unit: {detected} (counts: {counts})")
+    return detected
+
+
 _GEMINI_MODEL: str = "gemini-2.5-flash"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -649,7 +687,7 @@ CRITICAL STRING STANDARDIZATION RULES (APPLY TO BOTH STANDALONE & CONSOLIDATED):
 CRITICAL RULES FOR NUMBERS:
 - Numbers have spaces due to PDF formatting — remove spaces inside numbers. e.g. "11 48" = 1148
 - Numbers in brackets mean NEGATIVE. e.g. "(3 64)" = -364
-- All numbers are in lakhs — do not convert
+- {unit_note}
 - Two columns = current year (2024-25) and previous year (2023-24)
 - Use minus sign for negatives, never brackets
 
@@ -704,6 +742,9 @@ def _generate_with_retry(model, contents, config, max_attempts=4, base_delay=5):
 def call_gemini(text: str) -> list:
     from google.genai import types
 
+    unit_label = detect_reporting_unit(text)
+    unit_note  = f"All numbers in the source are in {unit_label} — do not convert to any other unit"
+
     split_point = int(len(text) * 0.60)
     chunks = [text[:split_point], text[split_point:]]
 
@@ -718,7 +759,7 @@ def call_gemini(text: str) -> list:
         print(f"  Sending chunk {i+1}/2 to Gemini...")
         response = _generate_with_retry(
             _GEMINI_MODEL,
-            _EXTRACTION_PROMPT_TEMPLATE.format(chunk=chunk),
+            _EXTRACTION_PROMPT_TEMPLATE.format(chunk=chunk, unit_note=unit_note),
             config,
         )
         raw   = response.text
@@ -816,7 +857,7 @@ from openpyxl.utils import get_column_letter
 # EXCEL BUILDER  —  visual layer only; all algebra/math logic is untouched
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_excel(df, output_path: str):
+def build_excel(df, output_path: str, unit_label: str = "₹ Lakh"):
 
     # ── Palette ───────────────────────────────────────────────────────────────
     C_NAVY        = "1B365D"   # Title fill
@@ -914,7 +955,7 @@ def build_excel(df, output_path: str):
         # purely additive and doesn't affect the self-verifying formulas.
         ws.row_dimensions[2].height = 28
         for col_letter, label in zip(["A", "B", "C", "D"],
-                                      ["Line Item", "FY25 (₹ Lakhs)", "FY24 (₹ Lakhs)", "Taxonomy Node"]):
+                                      ["Line Item", f"FY25 ({unit_label})", f"FY24 ({unit_label})", "Taxonomy Node"]):
             cell            = ws[f"{col_letter}2"]
             cell.value      = label
             cell.font       = HEADER_FONT
@@ -1207,6 +1248,7 @@ def extract_financials(pdf_path: str, output_xlsx: str = "financials.xlsx"):
     # of those changing produces a fresh cache miss automatically.
     # FORCE_REFRESH remains as an explicit manual override on top of that.
     pdf_text   = extract_text_from_pdf(pdf_path)
+    unit_label = detect_reporting_unit(pdf_text)
     cache_key  = _compute_step2_cache_key(pdf_text, _EXTRACTION_PROMPT_TEMPLATE, _GEMINI_MODEL)
     cache_file = _step2_cache_path(cache_key)
 
@@ -1264,7 +1306,7 @@ def extract_financials(pdf_path: str, output_xlsx: str = "financials.xlsx"):
     for seg in pipelines.values():
         print(f"  {seg.report_type}  |  statements: {list(seg.statements.keys())}  |  has_associates={seg.has_associates}")
 
-    build_excel(df, output_xlsx)
+    build_excel(df, output_xlsx, unit_label=unit_label)
 
     # ── Structured JSON output (taxonomy-mapped, for downstream reuse) ───────
     output_json = os.path.splitext(output_xlsx)[0] + "_taxonomy.json"

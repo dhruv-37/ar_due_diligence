@@ -38,6 +38,13 @@ _PNL_ITEMS = {
     "Other Comprehensive Income": ["other comprehensive income", "total other comprehensive income", "oci"],
     "Total Comprehensive Income": ["total comprehensive income", "total comprehensive income for the year"],
     "Earnings Per Share": ["earnings per equity share", "basic and diluted eps", "eps"],
+    "Basic EPS": ["basic (in h)", "basic (in rs)", "earnings per equity share basic",
+                  "basic earnings per share"],
+    "Diluted EPS": ["diluted (in h)", "diluted (in rs)", "earnings per equity share diluted",
+                    "diluted earnings per share"],
+    "Changes In Inventories": ["changes in inventories of finished goods work-in-progress and stock-in-trade",
+                                "changes in inventories", "change in inventories"],
+    "Non Controlling Interest": ["non-controlling interest", "non controlling interest", "minority interest"],
 }
 
 _BS_ITEMS = {
@@ -45,7 +52,10 @@ _BS_ITEMS = {
     "Capital Work In Progress": ["capital work-in-progress", "cwip"],
     "Goodwill": ["goodwill"],
     "Other Intangible Assets": ["other intangible assets", "intangible assets"],
+    "Intangible Assets Under Development": ["intangible assets under development",
+                                             "other intangible assets under development"],
     "Non Current Investments": ["non-current investments", "investments (non-current)"],
+    "Loans": ["loans"],
     "Deferred Tax Assets": ["deferred tax assets (net)", "deferred tax assets"],
     "Other Non Current Assets": ["other non-current assets"],
     "Total Non Current Assets": ["total non-current assets"],
@@ -69,6 +79,10 @@ _BS_ITEMS = {
     "Current Provisions": ["short-term provisions", "current provisions"],
     "Total Current Liabilities": ["total current liabilities"],
     "Total Equity And Liabilities": ["total equity and liabilities", "total liabilities"],
+    "Borrowings": ["borrowings"],
+    "Lease Liabilities": ["lease liabilities"],
+    "Provisions": ["provisions"],
+    "Non Controlling Interest": ["non-controlling interest", "non controlling interest", "minority interest"],
 }
 
 _CF_ITEMS = {
@@ -104,6 +118,8 @@ _SOCE_ITEMS = {
     "Total Comprehensive Income For The Year": ["total comprehensive income for the year"],
     "Dividend Distributed": ["dividends", "dividend"],
     "Transfer To Reserves": ["transfer to / (from) retained earnings", "transfer to reserves"],
+    "Equity Share Capital Change During The Year": ["equity share capital change during the year",
+                                                      "equity share capital - change during the year"],
 }
 
 _STATEMENT_TEMPLATE = {
