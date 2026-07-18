@@ -79,6 +79,32 @@ ALIAS_MAP: dict[str, list[str]] = {
         "Net cash flows generated from operating activities",
         "Net cash flows generated from / (used in) operating activities",
     ],
+    "investing_cash_flow": [
+        "Net Cash Used in Investing Activities", "Cash from Investing", "Investing Cash Flow",
+        "Net cash flows used in investing activities",
+        "Net cash flows generated from / (used in) investing activities",
+    ],
+    "financing_cash_flow": [
+        "Net Cash Used in Financing Activities", "Cash from Financing", "Financing Cash Flow",
+        "Net cash flows used in financing activities",
+        "Net cash flows generated from / (used in) financing activities",
+    ],
+    "cash_opening": [
+        "Cash and Cash Equivalents at the Beginning of the Year",
+        "Opening Cash Balance", "Cash and cash equivalents at beginning of the year",
+    ],
+    "cash_closing": [
+        "Cash and Cash Equivalents at the End of the Year",
+        "Closing Cash Balance", "Cash and cash equivalents at end of the year",
+    ],
+    "dividends_paid": [
+        "Dividends Paid", "Dividend Paid", "Payment of dividends",
+        "Dividends paid (including tax on dividend)",
+    ],
+    "retained_earnings": [
+        "Retained Earnings", "Reserves and Surplus", "Other Equity",
+        "Surplus in Statement of Profit and Loss",
+    ],
 }
 
 # Line items summed together when no single line matches a canonical field
@@ -106,6 +132,12 @@ _SCHEMA_LOCATION: dict[str, tuple[str, str]] = {
     "total_equity": ("balance_sheet", "total_equity"),
     "depreciation_amortization": ("cash_flow_statement", "depreciation_amortization"),
     "operating_cash_flow": ("cash_flow_statement", "operating_cash_flow"),
+    "investing_cash_flow": ("cash_flow_statement", "investing_cash_flow"),
+    "financing_cash_flow": ("cash_flow_statement", "financing_cash_flow"),
+    "cash_opening": ("cash_flow_statement", "cash_opening"),
+    "cash_closing": ("cash_flow_statement", "cash_closing"),
+    "dividends_paid": ("cash_flow_statement", "dividends_paid"),
+    "retained_earnings": ("balance_sheet", "retained_earnings"),
 }
 
 TOLERANCE = 1_000.0  # allowed rounding slack (thousands/millions reporting)
@@ -207,10 +239,16 @@ def _empty_schema(ticker: str, fy_t: int, fy_t_minus_1: int, reporting_unit: Opt
             "total_assets": {"t": None, "t_minus_1": None},
             "total_liabilities": {"t": None, "t_minus_1": None},
             "total_equity": {"t": None, "t_minus_1": None},
+            "retained_earnings": {"t": None, "t_minus_1": None},
         },
         "cash_flow_statement": {
             "depreciation_amortization": {"t": None, "t_minus_1": None},
             "operating_cash_flow": {"t": None, "t_minus_1": None},
+            "investing_cash_flow": {"t": None, "t_minus_1": None},
+            "financing_cash_flow": {"t": None, "t_minus_1": None},
+            "cash_opening": {"t": None, "t_minus_1": None},
+            "cash_closing": {"t": None, "t_minus_1": None},
+            "dividends_paid": {"t": None, "t_minus_1": None},
         },
     }
 

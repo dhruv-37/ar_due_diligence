@@ -13,6 +13,9 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import sys
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -41,6 +44,28 @@ _METRIC_ALIASES: dict[str, list[str]] = {
     "cash_opening": ["Cash and Cash Equivalents at the Beginning of the Year", "Opening Cash Balance"],
     "cash_closing": ["Cash and Cash Equivalents at the End of the Year", "Closing Cash Balance"],
     "dividends_paid": ["Dividends Paid", "Dividend Paid"],
+    "receivables": ["Trade Receivables", "Sundry Debtors", "Accounts Receivable", "Receivables"],
+    "total_current_assets": ["Total Current Assets", "Current Assets"],
+    "net_ppe": [
+        "Net Property Plant and Equipment",
+        "Property, Plant and Equipment (Net)",
+        "Property Plant and Equipment",
+        "Net Block",
+    ],
+    "ppe": ["Property, Plant and Equipment", "PPE", "Fixed Assets", "Gross Block"],
+    "retained_earnings": [
+        "Retained Earnings",
+        "Surplus in Statement of Profit and Loss",
+        "Retained Earnings/Accumulated Losses",
+        "Reserves and Surplus",
+        "Other Equity",
+    ],
+    "inventory": ["Inventories", "Inventory", "Stock-in-trade"],
+    "cogs": ["Cost of Materials Consumed", "Cost of Goods Sold", "COGS", "Purchases of Stock-in-Trade"],  # unused: see _compute_cogs_from_line_items
+    "cogs_reported": ["Cost of Goods Sold", "COGS", "Cost of Materials Consumed", "Cost of Sales"],
+    "profit_before_tax": ["Profit Before Tax", "Profit Before Exceptional Items and Tax", "PBT"],
+    "tax_expense": ["Total Tax Expense", "Tax Expense", "Current Tax"],
+    "cash_taxes_paid": ["Direct Taxes Paid", "Income Taxes Paid", "Taxes Paid"],
 }
 
 
@@ -68,6 +93,19 @@ def _f(value: Any) -> Optional[float]:
     return None
 
 
+def _first_significant_digit(value: float) -> Optional[int]:
+    """Return the first significant digit (1-9) of a positive number, or None."""
+    v = abs(value)
+    if v <= 0:
+        return None
+    while v < 1:
+        v *= 10
+    while v >= 10:
+        v /= 10
+    d = int(v)
+    return d if 1 <= d <= 9 else None
+
+
 class ForensicDiagnosticEngine:
     """
     Phase 2 diagnostic engine. Construct with the parsed financial JSON
@@ -83,6 +121,9 @@ class ForensicDiagnosticEngine:
         self.taxonomy_gaps: list[dict[str, Any]] = []
         self.mathematical_discrepancies: list[dict[str, Any]] = []
         self.forensic_red_flags: list[dict[str, Any]] = []
+        self.layer_a_signals: list[dict[str, Any]] = []
+        self.layer_b_signals: list[dict[str, Any]] = []
+        self.layer_c_signals: list[dict[str, Any]] = []
 
     # ─────────────────────────────────────────────────────────────────
     # METRIC LOOKUP HELPERS
@@ -109,6 +150,11 @@ class ForensicDiagnosticEngine:
         fs_dictionary slice, trying each known alias, case/whitespace
         insensitive, for the requested period ('current_year' / 'previous_year').
         """
+        if canonical == "cogs":
+            # COGS has no reliable single line item across schemas — derive it
+            # instead of keyword-matching (see _compute_cogs_from_line_items).
+            return self._compute_cogs_from_line_items(scope, period)
+
         scope_dict = self._scope_dict(scope)
         normalized_lookup = {_norm(k): v for k, v in scope_dict.items()}
         for alias in _METRIC_ALIASES.get(canonical, [canonical]):
@@ -122,6 +168,64 @@ class ForensicDiagnosticEngine:
                 if val is not None:
                     return val
         return None
+
+    def _compute_cogs_from_line_items(self, scope: str, period: str = "current_year") -> Optional[float]:
+        """
+        COGS proxy = Revenue from Operations - (sum of all P&L expense line
+        items that appear *before* Finance Costs in statement order).
+
+        We don't keyword-match a "COGS" line item — Indian Schedule III P&Ls
+        rarely have one. Instead we walk the ordered income-statement
+        line_items, sum every expense line up to (but excluding) the Finance
+        Costs line, and subtract that from Revenue from Operations. Works for
+        both "current_year" and "previous_year" since line_items carries both.
+        """
+        if period not in ("current_year", "previous_year"):
+            return None
+        value_field = "value" if period == "current_year" else "previous_year"
+
+        rfo = self._get_metric(scope, "revenue", period)
+        if rfo is None:
+            return None
+
+        income_stmt_keywords = ("income statement", "profit and loss", "p&l", "statement of profit and loss")
+        finance_cost_keywords = ("finance cost", "finance costs", "interest expense", "borrowing cost")
+        revenue_side_keywords = {_norm(a) for a in _METRIC_ALIASES.get("revenue", [])} | {"other income", "total income"}
+
+        expense_sum = 0.0
+        matched_any = False
+
+        for item in self.line_items:
+            report_type = item.get("report_type")
+            if report_type and _norm(report_type) != _norm(scope):
+                continue
+
+            fs_statement = _norm(item.get("fs_statement") or "")
+            if not any(kw in fs_statement for kw in income_stmt_keywords):
+                continue
+
+            label = _norm(item.get("raw_line_item") or "")
+            if not label:
+                continue
+
+            if any(kw in label for kw in finance_cost_keywords):
+                # everything from Finance Costs onward is excluded
+                break
+
+            if label in revenue_side_keywords:
+                continue
+
+            val = _f(item.get(value_field))
+            if val is None:
+                continue
+
+            expense_sum += abs(val)
+            matched_any = True
+
+        if not matched_any:
+            return None
+
+        return rfo - expense_sum
 
     # ─────────────────────────────────────────────────────────────────
     # A. DATA INTEGRITY & TAXONOMY DIAGNOSTICS
@@ -363,6 +467,303 @@ class ForensicDiagnosticEngine:
         return out
 
     # ─────────────────────────────────────────────────────────────────
+    # D. LAYER A — MATHEMATICAL SIGNATURES & MANIPULATION MODELS
+    # ─────────────────────────────────────────────────────────────────
+
+    _BENFORD_CRITICAL_CHI2 = 15.51  # d.f.=8, alpha=0.05
+
+    def run_layer_a_diagnostics(self) -> list[dict[str, Any]]:
+        """Benford's Law digit-distribution scan + Beneish M-Score core proxies."""
+        signals: list[dict[str, Any]] = []
+        signals.extend(self._check_benford_law())
+        for scope in _SCOPES:
+            signals.extend(self._check_dsri(scope))
+            signals.extend(self._check_aqi(scope))
+
+        self.layer_a_signals = signals
+        return signals
+
+    def _check_benford_law(self) -> list[dict[str, Any]]:
+        """Chi-square goodness-of-fit test of first-digit distribution vs Benford's Law."""
+        out: list[dict[str, Any]] = []
+
+        digits = []
+        for item in self.line_items:
+            val = _f(item.get("value", item.get("current_year")))
+            if val is None:
+                continue
+            d = _first_significant_digit(val)
+            if d is not None:
+                digits.append(d)
+
+        n = len(digits)
+        if n < 30:
+            # Sample too small for a meaningful chi-square test — skip gracefully.
+            return out
+
+        observed_counts = Counter(digits)
+        chi_square = 0.0
+        for d in range(1, 10):
+            expected_p = math.log10(1 + 1 / d)
+            expected = expected_p * n
+            observed = observed_counts.get(d, 0)
+            if expected > 0:
+                chi_square += ((observed - expected) ** 2) / expected
+
+        if chi_square > self._BENFORD_CRITICAL_CHI2:
+            out.append({
+                "risk_level": "WARNING",
+                "metric": "Benford's Law Digit Distribution",
+                "description": (
+                    f"First-significant-digit distribution across {n} line items deviates "
+                    f"from Benford's Law (chi-square={chi_square:.2f} > critical value "
+                    f"{self._BENFORD_CRITICAL_CHI2}) — Anomalous Digit Distribution."
+                ),
+                "variance": round(chi_square, 2),
+            })
+        return out
+
+    def _check_dsri(self, scope: str) -> list[dict[str, Any]]:
+        """Days Sales in Receivables Index — potential revenue inflation if > 1.2."""
+        out: list[dict[str, Any]] = []
+
+        rec_t = self._get_metric(scope, "receivables", "current_year")
+        rec_t1 = self._get_metric(scope, "receivables", "previous_year")
+        rev_t = self._get_metric(scope, "revenue", "current_year")
+        rev_t1 = self._get_metric(scope, "revenue", "previous_year")
+
+        if None in (rec_t, rec_t1, rev_t, rev_t1) or rev_t == 0 or rev_t1 == 0:
+            return out
+
+        ratio_t = rec_t / rev_t
+        ratio_t1 = rec_t1 / rev_t1
+        if ratio_t1 == 0:
+            return out
+
+        dsri = ratio_t / ratio_t1
+        if dsri > 1.2:
+            out.append({
+                "risk_level": "CRITICAL",
+                "metric": f"{scope} DSRI (Days Sales in Receivables Index)",
+                "description": (
+                    f"DSRI = {dsri:.2f} (> 1.2) — Receivables/Revenue grew disproportionately "
+                    f"year-over-year, a potential indicator of revenue inflation."
+                ),
+                "variance": round(dsri, 4),
+            })
+        return out
+
+    def _check_aqi(self, scope: str) -> list[dict[str, Any]]:
+        """Asset Quality Index — potential expense capitalization if > 1.3."""
+        out: list[dict[str, Any]] = []
+
+        ta_t = self._get_metric(scope, "total_assets", "current_year")
+        ta_t1 = self._get_metric(scope, "total_assets", "previous_year")
+        ca_t = self._get_metric(scope, "total_current_assets", "current_year")
+        ca_t1 = self._get_metric(scope, "total_current_assets", "previous_year")
+        ppe_t = self._get_metric(scope, "net_ppe", "current_year")
+        ppe_t1 = self._get_metric(scope, "net_ppe", "previous_year")
+
+        if None in (ta_t, ta_t1, ca_t, ca_t1, ppe_t, ppe_t1) or ta_t == 0 or ta_t1 == 0:
+            return out
+
+        soft_t = ta_t - ca_t - ppe_t
+        soft_t1 = ta_t1 - ca_t1 - ppe_t1
+
+        ratio_t = soft_t / ta_t
+        ratio_t1 = soft_t1 / ta_t1
+        if ratio_t1 == 0:
+            return out
+
+        aqi = ratio_t / ratio_t1
+        if aqi > 1.3:
+            out.append({
+                "risk_level": "CRITICAL",
+                "metric": f"{scope} AQI (Asset Quality Index)",
+                "description": (
+                    f"AQI = {aqi:.2f} (> 1.3) — Soft Assets (Total Assets - Current Assets - "
+                    f"PP&E) grew disproportionately relative to Total Assets, a potential "
+                    f"indicator of expense capitalization."
+                ),
+                "variance": round(aqi, 4),
+            })
+        return out
+
+    # ─────────────────────────────────────────────────────────────────
+    # E. LAYER B — INTER-PERIOD ARTICULATION CHECKS
+    # ─────────────────────────────────────────────────────────────────
+
+    _SLOAN_WARNING_THRESHOLD = 0.10
+    _SLOAN_CRITICAL_THRESHOLD = 0.15
+
+    def run_layer_b_diagnostics(self) -> list[dict[str, Any]]:
+        """Retained-earnings roll-forward + Sloan Ratio accruals anomaly checks."""
+        signals: list[dict[str, Any]] = []
+        for scope in _SCOPES:
+            signals.extend(self._check_retained_earnings_rollforward(scope))
+            signals.extend(self._check_sloan_ratio(scope))
+
+        self.layer_b_signals = signals
+        return signals
+
+    def _check_retained_earnings_rollforward(self, scope: str) -> list[dict[str, Any]]:
+        """RE_t = RE_t-1 + Net Profit_t - Dividends Paid_t."""
+        out: list[dict[str, Any]] = []
+
+        re_t = self._get_metric(scope, "retained_earnings", "current_year")
+        re_t1 = self._get_metric(scope, "retained_earnings", "previous_year")
+        profit_t = self._get_metric(scope, "profit_for_the_year", "current_year")
+        dividends_t = self._get_metric(scope, "dividends_paid", "current_year")
+
+        if None in (re_t, re_t1, profit_t):
+            return out
+        dividends_t = dividends_t or 0.0
+
+        expected_re_t = re_t1 + profit_t - abs(dividends_t)
+        diff = re_t - expected_re_t
+
+        if abs(diff) > TOLERANCE:
+            out.append({
+                "risk_level": "CRITICAL",
+                "metric": f"{scope} Retained Earnings Roll-Forward",
+                "description": (
+                    f"Retained Earnings ({re_t:,.2f}) does not equal prior-year Retained "
+                    f"Earnings ({re_t1:,.2f}) + Net Profit ({profit_t:,.2f}) - Dividends Paid "
+                    f"({abs(dividends_t):,.2f}) = {expected_re_t:,.2f} — Off-Statement Equity "
+                    f"Leakage."
+                ),
+                "variance": round(diff, 2),
+            })
+        return out
+
+    def _check_sloan_ratio(self, scope: str) -> list[dict[str, Any]]:
+        """Sloan Ratio = (Net Profit - OCF - ICF) / Total Assets."""
+        out: list[dict[str, Any]] = []
+
+        profit = self._get_metric(scope, "profit_for_the_year", "current_year")
+        ocf = self._get_metric(scope, "operating_cash_flow", "current_year")
+        icf = self._get_metric(scope, "investing_cash_flow", "current_year")
+        total_assets = self._get_metric(scope, "total_assets", "current_year")
+
+        if None in (profit, ocf, icf, total_assets) or total_assets == 0:
+            return out
+
+        sloan_ratio = (profit - ocf - icf) / total_assets
+        abs_ratio = abs(sloan_ratio)
+
+        if abs_ratio > self._SLOAN_CRITICAL_THRESHOLD:
+            out.append({
+                "risk_level": "CRITICAL",
+                "metric": f"{scope} Sloan Ratio (Accruals Anomaly)",
+                "description": (
+                    f"Sloan Ratio = {sloan_ratio:.4f} (|ratio| > {self._SLOAN_CRITICAL_THRESHOLD}) "
+                    f"— high non-cash accruals relative to Total Assets, a significant "
+                    f"earnings-quality risk."
+                ),
+                "variance": round(sloan_ratio, 4),
+            })
+        elif abs_ratio > self._SLOAN_WARNING_THRESHOLD:
+            out.append({
+                "risk_level": "WARNING",
+                "metric": f"{scope} Sloan Ratio (Accruals Anomaly)",
+                "description": (
+                    f"Sloan Ratio = {sloan_ratio:.4f} (|ratio| > {self._SLOAN_WARNING_THRESHOLD}) "
+                    f"— elevated non-cash accruals relative to Total Assets."
+                ),
+                "variance": round(sloan_ratio, 4),
+            })
+        return out
+
+    # ─────────────────────────────────────────────────────────────────
+    # F. LAYER C — CROSS-METRIC OPERATIONAL DRIFTS
+    # ─────────────────────────────────────────────────────────────────
+
+    _DSO_RECEIVABLES_VS_REVENUE_GAP = 0.30
+    _DSO_DAYS_JUMP = 15
+    _DSO_SLUGGISH_REVENUE_GROWTH = 0.10
+    _INVENTORY_GROWTH_THRESHOLD = 0.15
+    _INVENTORY_VS_COGS_GAP = 0.25
+
+    def run_layer_c_diagnostics(self) -> list[dict[str, Any]]:
+        """Cross-metric operational drift checks (DSO/Revenue, Inventory/COGS)."""
+        signals: list[dict[str, Any]] = []
+        for scope in _SCOPES:
+            self._run_layer_c_operational_drifts(scope, signals)
+
+        self.layer_c_signals = signals
+        return signals
+
+    def _run_layer_c_operational_drifts(self, scope: str, signals: list) -> None:
+        """
+        A. DSO vs. Revenue Growth Divergence (Channel Stuffing Guard)
+        B. Inventory vs. COGS Divergence (Margin Manipulation Guard)
+        Appends any triggered signals directly onto the caller-supplied list.
+        """
+        rev_t = self._get_metric(scope, "revenue", "current_year")
+        rev_t1 = self._get_metric(scope, "revenue", "previous_year")
+        rec_t = self._get_metric(scope, "receivables", "current_year")
+        rec_t1 = self._get_metric(scope, "receivables", "previous_year")
+
+        if None not in (rev_t, rev_t1, rec_t, rec_t1) and rev_t1 != 0 and rec_t1 != 0:
+            dso_t = (rec_t / rev_t) * 365 if rev_t else None
+            dso_t1 = (rec_t1 / rev_t1) * 365 if rev_t1 else None
+
+            revenue_growth = (rev_t - rev_t1) / rev_t1
+            receivables_growth = (rec_t - rec_t1) / rec_t1
+
+            dso_jump = (dso_t - dso_t1) if (dso_t is not None and dso_t1 is not None) else None
+
+            triggered = (receivables_growth - revenue_growth) > self._DSO_RECEIVABLES_VS_REVENUE_GAP
+            if not triggered and dso_jump is not None:
+                if dso_jump > self._DSO_DAYS_JUMP and revenue_growth < self._DSO_SLUGGISH_REVENUE_GROWTH:
+                    triggered = True
+
+            if triggered:
+                signals.append({
+                    "risk_level": "CRITICAL",
+                    "metric": f"{scope} DSO vs. Revenue Growth Divergence",
+                    "description": (
+                        f"Receivables growth ({receivables_growth*100:.1f}%) is outpacing Revenue "
+                        f"growth ({revenue_growth*100:.1f}%), and/or DSO jumped from {dso_t1:.1f} to "
+                        f"{dso_t:.1f} days while revenue growth was sluggish — Potential Channel "
+                        f"Stuffing / Aggressive Revenue Recognition."
+                    ),
+                    "variance": round(receivables_growth - revenue_growth, 4),
+                })
+
+        inv_t = self._get_metric(scope, "inventory", "current_year")
+        inv_t1 = self._get_metric(scope, "inventory", "previous_year")
+        cogs_t = self._get_metric(scope, "cogs_reported", "current_year")
+        cogs_t1 = self._get_metric(scope, "cogs_reported", "previous_year")
+
+        if None not in (inv_t, inv_t1) and inv_t1 != 0:
+            inventory_growth = (inv_t - inv_t1) / inv_t1
+
+            cogs_growth = None
+            if None not in (cogs_t, cogs_t1) and cogs_t1 != 0:
+                cogs_growth = (cogs_t - cogs_t1) / cogs_t1
+
+            triggered = False
+            if cogs_growth is not None:
+                if inventory_growth > self._INVENTORY_GROWTH_THRESHOLD and cogs_growth <= 0:
+                    triggered = True
+                elif (inventory_growth - cogs_growth) > self._INVENTORY_VS_COGS_GAP:
+                    triggered = True
+
+            if triggered:
+                cogs_growth_str = f"{cogs_growth*100:.1f}%" if cogs_growth is not None else "N/A"
+                signals.append({
+                    "risk_level": "HIGH",
+                    "metric": f"{scope} Inventory vs. COGS Divergence",
+                    "description": (
+                        f"Inventory growth ({inventory_growth*100:.1f}%) is disproportionate to "
+                        f"COGS growth ({cogs_growth_str}) — Potential Inventory Overvaluation / "
+                        f"Artificial Margin Inflation."
+                    ),
+                    "variance": round(inventory_growth - (cogs_growth or 0.0), 4),
+                })
+
+    # ─────────────────────────────────────────────────────────────────
     # SCORING & REPORT ASSEMBLY
     # ─────────────────────────────────────────────────────────────────
 
@@ -393,6 +794,33 @@ class ForensicDiagnosticEngine:
             # but don't penalize the score — they're completeness noise,
             # not a financial concern, unless they're material (>5% of base)
 
+        for signal in self.layer_a_signals:
+            level = signal.get("risk_level")
+            if level == "CRITICAL":
+                score -= 15.0
+            elif level == "WARNING":
+                score -= 7.0
+            else:
+                score -= 2.0
+
+        for signal in self.layer_b_signals:
+            level = signal.get("risk_level")
+            if level == "CRITICAL":
+                score -= 15.0
+            elif level == "WARNING":
+                score -= 7.0
+            else:
+                score -= 2.0
+
+        for signal in self.layer_c_signals:
+            level = signal.get("risk_level")
+            if level in ("CRITICAL", "HIGH"):
+                score -= 15.0
+            elif level == "WARNING":
+                score -= 7.0
+            else:
+                score -= 2.0
+
         return max(0.0, round(score, 2))
 
     def run_full_diagnostics(self) -> dict[str, Any]:
@@ -403,6 +831,12 @@ class ForensicDiagnosticEngine:
         self.verify_accounting_math()
         logger.info("Running forensic red-flag detection...")
         self.detect_red_flags()
+        logger.info("Running Layer A mathematical signature models...")
+        self.run_layer_a_diagnostics()
+        logger.info("Running Layer B inter-period articulation checks...")
+        self.run_layer_b_diagnostics()
+        logger.info("Running Layer C cross-metric operational drift checks...")
+        self.run_layer_c_diagnostics()
 
         report = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -410,6 +844,9 @@ class ForensicDiagnosticEngine:
             "taxonomy_gaps": self.taxonomy_gaps,
             "mathematical_discrepancies": self.mathematical_discrepancies,
             "forensic_red_flags": self.forensic_red_flags,
+            "layer_a_signals": self.layer_a_signals,
+            "layer_b_signals": self.layer_b_signals,
+            "layer_c_signals": self.layer_c_signals,
         }
         logger.info("Diagnostics complete. Integrity score: %.2f", report["integrity_score"])
         return report
@@ -458,6 +895,39 @@ class ForensicDiagnosticEngine:
         else:
             lines.append("- None")
 
+        lines.append(f"\n## Layer A — Mathematical Signatures ({len(report.get('layer_a_signals', []))})")
+        if report.get("layer_a_signals"):
+            icon = {"CRITICAL": "🔴", "WARNING": "🟠", "INFO": "🔵"}
+            for s in report["layer_a_signals"]:
+                lines.append(
+                    f"- {icon.get(s['risk_level'], '')} **[{s['risk_level']}] {s['metric']}**: "
+                    f"{s['description']} (variance: {s['variance']})"
+                )
+        else:
+            lines.append("- None")
+
+        lines.append(f"\n## Layer B — Inter-Period Articulation ({len(report.get('layer_b_signals', []))})")
+        if report.get("layer_b_signals"):
+            icon = {"CRITICAL": "🔴", "WARNING": "🟠", "INFO": "🔵"}
+            for s in report["layer_b_signals"]:
+                lines.append(
+                    f"- {icon.get(s['risk_level'], '')} **[{s['risk_level']}] {s['metric']}**: "
+                    f"{s['description']} (variance: {s['variance']})"
+                )
+        else:
+            lines.append("- None")
+
+        lines.append(f"\n## Layer C — Cross-Metric Operational Drifts ({len(report.get('layer_c_signals', []))})")
+        if report.get("layer_c_signals"):
+            icon = {"CRITICAL": "🔴", "HIGH": "🟣", "WARNING": "🟠", "INFO": "🔵"}
+            for s in report["layer_c_signals"]:
+                lines.append(
+                    f"- {icon.get(s['risk_level'], '')} **[{s['risk_level']}] {s['metric']}**: "
+                    f"{s['description']} (variance: {s['variance']})"
+                )
+        else:
+            lines.append("- None")
+
         return "\n".join(lines)
 
 
@@ -481,22 +951,56 @@ def build_diagnostic_input_from_pipeline(
         line_items.append({
             "raw_line_item": rec.get("line_item"),
             "value": rec.get("current_year"),
+            "previous_year": rec.get("previous_year"),
             "fs_statement": rec.get("fs_statement") or rec.get("statement"),
             "match_score": rec.get("match_score"),
             "report_type": rec.get("report_type"),
         })
 
     def _metric_dict(normalized: dict[str, Any]) -> dict[str, Any]:
-        inc = normalized.get("income_statement", {})
-        bs = normalized.get("balance_sheet", {})
-        cf = normalized.get("cash_flow_statement", {})
+        inc = normalized.get("income_statement") or normalized.get("Income Statement") or {}
+        bs = normalized.get("balance_sheet") or normalized.get("Balance Sheet") or {}
+        cf = normalized.get("cash_flow_statement") or normalized.get("Cash Flow Statement") or {}
+
+        def _remap_periods(entry: Any) -> dict[str, Any]:
+            # normalize_financials() emits {"t": ..., "t_minus_1": ...};
+            # the engine reads {"current_year": ..., "previous_year": ...}.
+            if not isinstance(entry, dict):
+                return {}
+            return {
+                "current_year": entry.get("current_year", entry.get("t")),
+                "previous_year": entry.get("previous_year", entry.get("t_minus_1")),
+            }
+
+        def safe_get(canonical_key: str, statement_dict: dict[str, Any]) -> dict[str, Any]:
+            entry = statement_dict.get(canonical_key) or normalized.get(canonical_key) or {}
+            return _remap_periods(entry)
+
         return {
-            "Revenue from Operations": inc.get("revenue", {}),
-            "Profit for the Year": inc.get("net_income_continuing", {}),
-            "Total Assets": bs.get("total_assets", {}),
-            "Total Liabilities": bs.get("total_liabilities", {}),
-            "Total Equity": bs.get("total_equity", {}),
-            "Net Cash From Operating Activities": cf.get("operating_cash_flow", {}),
+            # Baseline Financials
+            "Revenue from Operations": safe_get("revenue", inc),
+            "Profit for the Year": safe_get("net_income_continuing", inc) or safe_get("profit_for_the_year", inc),
+            "Total Assets": safe_get("total_assets", bs),
+            "Total Liabilities": safe_get("total_liabilities", bs),
+            "Total Equity": safe_get("total_equity", bs),
+
+            # Core Cash Flows
+            "Net Cash From Operating Activities": safe_get("operating_cash_flow", cf),
+            "Net Cash From Investing Activities": safe_get("investing_cash_flow", cf),
+            "Net Cash From Financing Activities": safe_get("financing_cash_flow", cf),
+            "Cash and Cash Equivalents at the Beginning of the Year": safe_get("cash_opening", cf),
+            "Cash and Cash Equivalents at the End of the Year": safe_get("cash_closing", cf),
+            "Dividends Paid": safe_get("dividends_paid", cf),
+
+            # Advanced Forensic Structural Mappings (Layer A & B)
+            "Trade Receivables": safe_get("accounts_receivable_net", bs) or safe_get("receivables", bs) or safe_get("trade_receivables", bs),
+            "Total Current Assets": safe_get("total_current_assets", bs) or safe_get("current_assets", bs),
+            "Net Property Plant and Equipment": safe_get("property_plant_equipment_net", bs) or safe_get("net_ppe", bs) or safe_get("ppe", bs),
+            "Retained Earnings": safe_get("retained_earnings", bs) or safe_get("reserves_surplus", bs),
+
+            # Advanced Forensic Structural Mappings (Layer C)
+            "Inventories": safe_get("inventories", bs) or safe_get("inventory", bs),
+            "Cost of Goods Sold": safe_get("cost_of_goods_sold", inc) or safe_get("cogs", inc),
         }
 
     return {
@@ -554,7 +1058,7 @@ def run_full_pipeline(
     logger.info("Step 2: parsing & building Excel -> %s", output_xlsx)
     extract_financials(trimmed_pdf, output_xlsx)
 
-    with open(taxonomy_json_path, "r") as f:
+    with open(taxonomy_json_path, "r", encoding="utf-8") as f:
         taxonomy_json = json.load(f)
 
     logger.info("Step 3: normalizing (Standalone + Consolidated)")
@@ -564,9 +1068,9 @@ def run_full_pipeline(
     normalized_consolidated = run_pipeline_from_step2(
         taxonomy_json_path, ticker, fy, fy_prev, report_type="Consolidated"
     )
-    with open(normalized_standalone_path, "w") as f:
+    with open(normalized_standalone_path, "w", encoding="utf-8") as f:
         json.dump(normalized_standalone, f, indent=2)
-    with open(normalized_consolidated_path, "w") as f:
+    with open(normalized_consolidated_path, "w", encoding="utf-8") as f:
         json.dump(normalized_consolidated, f, indent=2)
 
     logger.info("Step 4: running forensic diagnostics")
@@ -576,10 +1080,13 @@ def run_full_pipeline(
     engine = ForensicDiagnosticEngine(diagnostic_input)
     report = engine.run_full_diagnostics()
 
-    with open(diagnostic_json_path, "w") as f:
+    with open(diagnostic_json_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
-    with open(diagnostic_md_path, "w") as f:
+    with open(diagnostic_md_path, "w", encoding="utf-8") as f:
         f.write(ForensicDiagnosticEngine.to_markdown(report))
+
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     print(f"\n📄  Diagnostics JSON  -> {diagnostic_json_path}")
     print(f"📄  Diagnostics MD    -> {diagnostic_md_path}")
